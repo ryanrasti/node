@@ -143,13 +143,15 @@ inline GenericCall Lookup(Address function) {
 
 }  // namespace v8::internal::sim_c_thunks
 
-// registers function f's thunk
-#define V8_SIM_C_THUNK(f)                                           \
+// registers function f's thunk (variadic: f may be a template's
+// instantiation, its arguments separated by commas)
+#define V8_SIM_C_THUNK(...)                                         \
   ::v8::internal::sim_c_thunks::Register(                           \
-      FUNCTION_ADDR(f), &::v8::internal::sim_c_thunks::Thunk<&f>)
+      FUNCTION_ADDR((__VA_ARGS__)),                                 \
+      &::v8::internal::sim_c_thunks::Thunk<&__VA_ARGS__>)
 
 #else
-#define V8_SIM_C_THUNK(f) ((void)0)
+#define V8_SIM_C_THUNK(...) ((void)0)
 #endif  // defined(USE_SIMULATOR) && V8_HOST_ARCH_WASM32
 
 #endif  // V8_EXECUTION_SIMULATOR_C_THUNKS_H_

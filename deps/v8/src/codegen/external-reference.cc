@@ -1303,6 +1303,7 @@ FUNCTION_REFERENCE(refill_math_random, MathRandom::RefillCache)
 template <typename SubjectChar, typename PatternChar>
 ExternalReference ExternalReference::search_string_raw() {
   auto f = SearchStringRaw<SubjectChar, PatternChar>;
+  V8_SIM_C_THUNK(SearchStringRaw<SubjectChar, PatternChar>);
   return ExternalReference(Redirect(FUNCTION_ADDR(f)));
 }
 

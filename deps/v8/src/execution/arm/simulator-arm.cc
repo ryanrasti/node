@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/execution/arm/simulator-arm-xlate.h"
+#include "src/snapshot/embedded/embedded-data.h"
 #endif
 
 #include "src/base/logging.h"
@@ -1939,6 +1940,17 @@ void Simulator::SoftwareInterrupt(Instruction* instr) {
           PrintF("\n");
         }
         CHECK(stack_aligned);
+#if V8_HOST_ARCH_WASM32
+        if (sim_c_thunks::Lookup(external) == nullptr) {
+          // which call has no thunk: its type, and the builtin calling it
+          Builtin caller = OffHeapInstructionStream::TryLookupCode(
+              isolate_, static_cast<Address>(saved_lr));
+          PrintF("simulator: call (type %d) from %s, no thunk for %p\n",
+                 static_cast<int>(redirection->type()),
+                 Builtins::IsBuiltinId(caller) ? Builtins::name(caller) : "?",
+                 reinterpret_cast<void*>(external));
+        }
+#endif
         int64_t result = UnsafeGenericFunctionCall(
             external, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8,
             arg9, arg10, arg11, arg12, arg13, arg14, arg15, arg16, arg17, arg18,
