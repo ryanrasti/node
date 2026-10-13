@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "src/codegen/external-reference.h"
+#include "src/execution/simulator-c-thunks.h"
 
 #include <optional>
 
@@ -454,15 +455,19 @@ struct IsValidExternalReferenceType<Result (Class::*)(Args...)> {
   }
 
 // .. for functions that will be called through CallCFunction.
+// (V8_SIM_C_THUNK: the simulator's exact-signature call, on a wasm32 host;
+// see src/execution/simulator-c-thunks.h)
 #define FUNCTION_REFERENCE(Name, Target)                                   \
   ExternalReference ExternalReference::Name() {                            \
     static_assert(IsValidExternalReferenceType<decltype(&Target)>::value); \
+    V8_SIM_C_THUNK(Target);                                                \
     return ExternalReference(Redirect(FUNCTION_ADDR(Target)));             \
   }
 
 #define FUNCTION_REFERENCE_WITH_TYPE(Name, Target, Type)                   \
   ExternalReference ExternalReference::Name() {                            \
     static_assert(IsValidExternalReferenceType<decltype(&Target)>::value); \
+    V8_SIM_C_THUNK(Target);                                                \
     return ExternalReference(Redirect(FUNCTION_ADDR(Target), Type));       \
   }
 

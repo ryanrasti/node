@@ -148,6 +148,8 @@ EmbeddedTargetOs ToEmbeddedTargetOs(const char* s) {
     return EmbeddedTargetOs::kStarboard;
   } else if (string == "zos") {
     return EmbeddedTargetOs::kZOS;
+  } else if (string == "wasm") {
+    return EmbeddedTargetOs::kWasm;
   } else {
     return EmbeddedTargetOs::kGeneric;
   }

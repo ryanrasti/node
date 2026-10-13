@@ -32,7 +32,20 @@ const char* DirectiveAsString(DataDirective directive) {
 
 }  // namespace
 
+void PlatformEmbeddedFileWriterGeneric::WasmEndSymbol() {
+  if (wasm_symbol_.empty()) return;
+  fprintf(fp_, ".Lend_%s:\n", wasm_symbol_.c_str());
+  fprintf(fp_, ".size %s, .Lend_%s-%s\n", wasm_symbol_.c_str(),
+          wasm_symbol_.c_str(), wasm_symbol_.c_str());
+  wasm_symbol_.clear();
+}
+
 void PlatformEmbeddedFileWriterGeneric::SectionText() {
+  if (wasm()) {
+    WasmEndSymbol();
+    fprintf(fp_, ".section .rodata.v8_embedded_%d,\"\",@\n", wasm_sections_++);
+    return;
+  }
   if (target_os_ == EmbeddedTargetOs::kChromeOS) {
     fprintf(fp_, ".section .text.hot.embedded\n");
   } else {
@@ -41,6 +54,7 @@ void PlatformEmbeddedFileWriterGeneric::SectionText() {
 }
 
 void PlatformEmbeddedFileWriterGeneric::SectionRoData() {
+  if (wasm()) return SectionText();
   fprintf(fp_, ".section .rodata\n");
 }
 
@@ -54,6 +68,11 @@ void PlatformEmbeddedFileWriterGeneric::DeclareUint32(const char* name,
 }
 
 void PlatformEmbeddedFileWriterGeneric::DeclareSymbolGlobal(const char* name) {
+  if (wasm()) {
+    // the one before ends here (DeclareUint32 runs these back to back)
+    WasmEndSymbol();
+    wasm_symbol_ = name;
+  }
   fprintf(fp_, ".global %s%s\n", SYMBOL_PREFIX, name);
   // These symbols are not visible outside of the final binary, this allows for
   // reduced binary size, and less work for the dynamic linker.
@@ -109,6 +128,7 @@ void PlatformEmbeddedFileWriterGeneric::DeclareLabel(const char* name) {
 void PlatformEmbeddedFileWriterGeneric::SourceInfo(int fileid,
                                                    const char* filename,
                                                    int line) {
+  if (wasm()) return;
   fprintf(fp_, ".loc %d %d\n", fileid, line);
 }
 
@@ -119,6 +139,10 @@ void PlatformEmbeddedFileWriterGeneric::DeclareFunctionBegin(const char* name,
     DeclareSymbolGlobal(name);
   }
 #endif  // V8_ENABLE_DRUMBRAKE
+
+  // (wasm: no symbol per builtin, which would be a data symbol needing a
+  // size of its own; the blob's own metadata says where each one is)
+  if (wasm()) return Comment(name);
 
   DeclareLabel(name);
 
@@ -141,6 +165,7 @@ void PlatformEmbeddedFileWriterGeneric::FilePrologue() {}
 
 void PlatformEmbeddedFileWriterGeneric::DeclareExternalFilename(
     int fileid, const char* filename) {
+  if (wasm()) return;
   // Replace any Windows style paths (backslashes) with forward
   // slashes.
   std::string fixed_filename(filename);
@@ -149,6 +174,7 @@ void PlatformEmbeddedFileWriterGeneric::DeclareExternalFilename(
 }
 
 void PlatformEmbeddedFileWriterGeneric::FileEpilogue() {
+  if (wasm()) return WasmEndSymbol();
   // Omitting this section can imply an executable stack, which is usually
   // a linker warning/error. C++ compilers add these automatically, but
   // compiling assembly requires the .note.GNU-stack section to be inserted

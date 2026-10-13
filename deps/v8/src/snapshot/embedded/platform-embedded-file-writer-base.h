@@ -36,6 +36,9 @@ enum class EmbeddedTargetOs {
   kWin,
   kStarboard,
   kZOS,
+  // linux-workers: a wasm assembler's dialect (the blob is data, which V8's
+  // simulator runs; see PlatformEmbeddedFileWriterGeneric)
+  kWasm,
   kGeneric,  // Everything not covered above falls in here.
 };
 

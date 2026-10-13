@@ -544,7 +544,8 @@
           '-Wl,-bnoerrmsg',
         ],
       }],
-      ['OS=="linux" and clang==1', {
+      # (not wasm32's: its atomics are wasm's own, 64-bit too)
+      ['OS=="linux" and clang==1 and target_arch!="wasm32"', {
         'libraries': ['-latomic'],
       }],
     ],

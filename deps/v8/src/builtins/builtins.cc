@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "src/builtins/builtins.h"
+#include "src/execution/simulator-c-thunks.h"
 
 #include "src/api/api-inl.h"
 #include "src/builtins/builtins-descriptors.h"
@@ -31,6 +32,19 @@ namespace internal {
   Address Builtin_##Name(int argc, Address* args, Isolate* isolate);
 BUILTIN_LIST_C(FORWARD_DECLARE)
 #undef FORWARD_DECLARE
+
+#if defined(USE_SIMULATOR) && V8_HOST_ARCH_WASM32
+// the simulator's exact-signature calls (src/execution/simulator-c-thunks.h)
+namespace {
+struct RegisterBuiltinThunks {
+  RegisterBuiltinThunks() {
+#define T(Name, Argc) V8_SIM_C_THUNK(Builtin_##Name);
+    BUILTIN_LIST_C(T)
+#undef T
+  }
+} register_builtin_thunks;
+}  // namespace
+#endif
 
 namespace {
 

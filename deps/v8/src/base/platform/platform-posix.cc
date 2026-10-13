@@ -775,6 +775,8 @@ void OS::DebugBreak() {
   asm("ebreak");
 #elif V8_HOST_ARCH_RISCV32
   asm("ebreak");
+#elif V8_HOST_ARCH_WASM32
+  __builtin_trap();  // linux-workers: the host makes it SIGILL
 #else
 #error Unsupported host architecture.
 #endif

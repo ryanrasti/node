@@ -451,6 +451,13 @@
           ],
           'process_outputs_as_sources': 1,
           'conditions': [
+            # linux-workers: for a wasm compiler, the embedded blob in a wasm
+            # assembler's dialect (its --target_os, the last one, wins)
+            ['target_arch=="wasm32"', {
+              'variables': {
+                'mksnapshot_flags': ['--target_os=wasm'],
+              },
+            }],
             ['v8_random_seed', {
               'variables': {
                 'mksnapshot_flags': ['--random-seed', '<(v8_random_seed)'],
@@ -1342,7 +1349,8 @@
         # Platforms that don't have Compare-And-Swap (CAS) support need to link atomic library
         # to implement atomic memory access.
         # Clang needs it for some atomic operations (https://clang.llvm.org/docs/Toolchain.html#atomics-library).
-        ['(OS=="linux" and clang==1) or (v8_current_cpu in ["mips64", "mips64el", "arm", "riscv64", "loong64"])', {
+        # (not wasm32's: its atomics are wasm's own, 64-bit too)
+        ['target_arch!="wasm32" and ((OS=="linux" and clang==1) or (v8_current_cpu in ["mips64", "mips64el", "arm", "riscv64", "loong64"]))', {
           'link_settings': {
             'libraries': ['-latomic', ],
           },
@@ -2096,6 +2104,12 @@
               ['_toolset == "host" and host_arch == "ia32" or _toolset == "target" and target_arch=="ia32"', {
                 'sources': [
                   '<(V8_ROOT)/src/heap/base/asm/ia32/push_registers_asm.cc',
+                ],
+              }],
+              # linux-workers: no registers to push (asm/wasm32/push_registers.cc)
+              ['_toolset == "target" and target_arch=="wasm32"', {
+                'sources': [
+                  '<(V8_ROOT)/src/heap/base/asm/wasm32/push_registers.cc',
                 ],
               }],
               ['_toolset == "host" and host_arch == "arm" or _toolset == "target" and target_arch=="arm"', {

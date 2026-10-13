@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "src/runtime/runtime.h"
+#include "src/execution/simulator-c-thunks.h"
 
 #include "src/base/hashmap.h"
 #include "src/execution/isolate.h"
@@ -45,6 +46,19 @@ static const Runtime::Function kIntrinsicFunctions[] = {
 
 #undef I
 #undef F
+
+#if defined(USE_SIMULATOR) && V8_HOST_ARCH_WASM32
+// the simulator's exact-signature calls (src/execution/simulator-c-thunks.h)
+namespace {
+struct RegisterRuntimeThunks {
+  RegisterRuntimeThunks() {
+#define T(name, number_of_args, result_size) V8_SIM_C_THUNK(Runtime_##name);
+    FOR_EACH_INTRINSIC(T)
+#undef T
+  }
+} register_runtime_thunks;
+}  // namespace
+#endif
 
 namespace {
 

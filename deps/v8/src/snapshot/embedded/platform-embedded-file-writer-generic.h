@@ -19,6 +19,7 @@ class PlatformEmbeddedFileWriterGeneric
       : target_arch_(target_arch), target_os_(target_os) {
     DCHECK(target_os_ == EmbeddedTargetOs::kChromeOS ||
            target_os_ == EmbeddedTargetOs::kFuchsia ||
+           target_os_ == EmbeddedTargetOs::kWasm ||
            target_os_ == EmbeddedTargetOs::kGeneric);
   }
 
@@ -51,6 +52,14 @@ class PlatformEmbeddedFileWriterGeneric
  private:
   const EmbeddedTargetArch target_arch_;
   const EmbeddedTargetOs target_os_;
+
+  // kWasm: a wasm assembler's dialect. The blob is all data (V8's simulator
+  // runs the code), each global symbol in a data section of its own, sized
+  // (as wasm data symbols must be) when the next one starts.
+  bool wasm() const { return target_os_ == EmbeddedTargetOs::kWasm; }
+  void WasmEndSymbol();
+  std::string wasm_symbol_;  // the global symbol being written, if any
+  int wasm_sections_ = 0;
 };
 
 }  // namespace internal

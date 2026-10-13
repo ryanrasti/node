@@ -198,6 +198,9 @@ void* GetProgramCounter(void* const vuc) {
     return reinterpret_cast<void*>(context->uc_mcontext.cr0_hi);
 #elif defined(__loongarch__)
     return reinterpret_cast<void*>(context->uc_mcontext.__pc);
+#elif defined(__wasm32__)
+    // linux-workers: wasm has no program counter to read
+    return nullptr;
 #else
 #error "Undefined Architecture."
 #endif
