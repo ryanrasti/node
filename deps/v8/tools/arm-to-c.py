@@ -14,17 +14,24 @@ table the simulator finds them in.
 
 The translation decodes each instruction as the simulator does
 (Simulator::InstructionDecode, simulator-arm.cc) and does what it does, in
-the same order. What it doesn't translate (calls into C++: svc; exclusive
-loads and stores; NEON; what the simulator itself doesn't implement) ends
-the function: the simulator runs that instruction, and the translated code
-resumes after it. Constant pools are decoded too, harmlessly: nothing
-branches to them.
+the same order. Constant pools are decoded too, harmlessly: nothing branches
+to them.
 
-A function's entries, where the simulator's loop may enter it: its start,
-the instruction after each call (a return address), after each instruction
-it leaves to the simulator, and each address its code takes of itself
-(add rX, pc, #imm). Inside, branches are gotos; a computed jump (bx, ldr pc,
-ldm {pc}, mov pc) goes back to the entry switch if it stays in the function.
+Each function takes the core registers as arguments (the flags stay in the
+state) and leaves by a wasm tail call to the function of the builtin it
+jumps to, the registers passed along. Inside, branches are gotos; a computed
+jump (bx, ldr pc, ldm {pc}, mov pc) goes back to the entry switch if it
+stays in the function. A call (bl, blx) is a native call, which resumes at
+the return address when execution comes back to it. What the translation
+leaves out (calls into C++, which go through the simulator's redirection:
+svc; exclusive loads and stores; NEON; what the simulator itself doesn't
+implement) returns all of it to the simulator's loop, which simulates that
+instruction, and the translated code goes on after it.
+
+A function's entries, where it may be entered: its start, the instruction
+after each call (a return address), after each instruction it leaves to the
+simulator, each address its code takes of itself (add rX, pc, #imm), and
+jump tables' branches.
 """
 
 import re
@@ -88,128 +95,20 @@ class Unsupported(Exception):
   pass
 
 
-class Group:
-  """Builtins translated as one function: jumps and calls between them are
-  gotos (the bytecode handlers' dispatch, above all)."""
-
-  def __init__(self, index, members):
-    self.index = index  # its function: xg_<index>
-    self.members = members
-    self.labels = set()  # offsets that need a label
-    self.entries = set()  # offsets the entry switch reaches
-    for b in members:
-      b.group = self
-      self.labels.add(b.start)
-      self.entries.add(b.start)
-
-  def contains(self, off):
-    return any(b.start <= off < b.end for b in self.members)
-
-  def emit(self):
-    out = []
-    w = out.append
-    ops = []
-    for b in self.members:
-      for a in range(b.start, b.end, 4):
-        try:
-          body = b.translate(a, b.word(a))
-        except Unsupported:
-          body = None
-        ops.append((a, b.word(a), body))
-      ops.append((b.end, None, None))  # falling off its end
-    text = "".join(body for _, _, body in ops if body)
-    calls = "goto call" in text
-    used = {int(n) for n in re.findall(r"\br(\d+)\b", text)} | ({14} if calls else set())
-    written = {int(n) for n in re.findall(r"\br(\d+) = ", text)} | ({14} if calls else set())
-    others = sorted(used - set(PARAM_REGS))  # in the state
-    wothers = sorted(written - set(PARAM_REGS))
-    flags = [f for f in "NZCV" if re.search(r"\b%s\b" % f, text)]
-    wflags = [f for f in "NZCV" if re.search(r"\b%s = " % f, text)]
-    args = ", ".join("r%d" % n for n in PARAM_REGS)
-    load = ("  " + " ".join("r%d = (uint32_t)R[%d];" % (n, n) for n in others) +
-            " " + " ".join("%s = *P%s;" % (f, f) for f in flags) + "\n")
-    save = ("  " + " ".join("R[%d] = (int32_t)r%d;" % (n, n) for n in wothers) +
-            " " + " ".join("*P%s = %s;" % (f, f) for f in wflags) + "\n")
-    # after a native call: all of them from the state, the arguments too
-    # (v8_arm_xlate_next saved them)
-    reload = ("  " + " ".join("r%d = (uint32_t)R[%d];" % (n, n)
-                              for n in sorted(set(PARAM_REGS) | set(others))) +
-              " " + " ".join("%s = *P%s;" % (f, f) for f in flags) + "\n")
-    for b in self.members:
-      w("// %s\n" % b.name)
-    w("XL_TAIL uint32_t xg_%d(State* s, uint32_t pc, XL_PARAMS) {\n" % self.index)
-    w("  const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;\n")
-    # (the state's pointers in locals: V8 compiles without strict aliasing,
-    # so through s they'd be reloaded after every store)
-    w("  int32_t* const R = s->r;\n"
-      "  bool *const PN = s->n, *const PZ = s->z, *const PC = s->c, "
-      "*const PV = s->v;\n")
-    if others:
-      w("  uint32_t %s;\n" % ", ".join("r%d" % n for n in others))
-    if flags:
-      w("  uint32_t %s;\n" % ", ".join(flags))
-    w(load)
-    w("  uint32_t npc, ct, cr;\n")
-    w("top:\n  switch (pc - B) {\n")
-    for e in sorted(self.entries):
-      w("    case 0x%x: goto L%x;\n" % (e, e))
-    w("    default: npc = pc; goto fb;\n  }\n")
-    for a, word, body in ops:
-      if word is None:
-        w("  npc = B + 0x%x; goto jmp;\n" % a)
-        continue
-      if a in self.labels:
-        w("L%x:\n" % a)
-      if body is None:
-        w("  npc = B + 0x%x; goto fb;  // %08x\n" % (a, word))
-      else:
-        w(body)
-    # a computed jump: back to the entry switch if it stays here
-    if len(self.members) == 1:
-      b = self.members[0]
-      inside = "npc - B - 0x%x < 0x%x" % (b.start, b.end - b.start)
-      inside_ct = "false"
-    else:
-      inside = "in_group(npc - B, %d)" % self.index
-      inside_ct = "in_group(ct - B, %d)" % self.index
-    w("jmp:\n  if (%s && npc != s->ret) { pc = npc; goto top; }\n" % inside)
-    # leaving: the next builtin, tail-called (v8_arm_xlate_next's lookup,
-    # inline; it does the rest)
-    w("out:\n" + save + "  if (npc != s->ret) {\n"
-      "    uint32_t offset = npc - B;\n"
-      "    if (offset < v8_arm_xlate_blob_size) {\n"
-      "      Function f = s->functions[v8_arm_xlate_index[offset >> 5]];\n"
-      "      if (f) [[clang::musttail]] return f(s, npc, %s);\n"
-      "    }\n  }\n" % args)
-    w("  [[clang::musttail]] return v8_arm_xlate_next(s, npc, %s);\n" % args)
-    # an instruction for the simulator
-    w("fb:\n" + save +
-      "  [[clang::musttail]] return v8_arm_xlate_unwind(s, npc, %s);\n" % args)
-    # a call (bl, blx; r14 set): a goto in the group; else native, unless
-    # too deep (then a jump: the callee returns through the dispatch)
-    w("call:\n  if (%s) { pc = ct; goto top; }\n" % inside_ct)
-    w("  if (s->depth >= kMaxDepth) { npc = ct; goto out; }\n" + save +
-      "  {\n    uint32_t outer = s->ret;\n    s->ret = cr; s->depth++;\n"
-      "    uint32_t r = v8_arm_xlate_next(s, ct, %s);\n"
-      "    s->ret = outer; s->depth--;\n"
-      "    if (r != cr || s->unwind) return r;\n  }\n" % args)
-    w(reload + "  npc = cr; goto jmp;\n}\n\n")
-    return "".join(out)
-
-
 class Builtin:
   """One builtin's translation."""
 
   def __init__(self, index, name, start, end, code):
     self.index, self.name, self.start, self.end = index, name, start, end
     self.code = code  # the whole blob
-    self.group = None
+    self.labels = {start}  # offsets that need a label
+    self.entries = {start}  # offsets the entry switch reaches
 
   def word(self, off):
     return int.from_bytes(self.code[off:off + 4], "little")
 
-  def inside(self, off):  # in its group
-    return self.group.contains(off)
+  def inside(self, off):
+    return self.start <= off < self.end
 
   # --- the first pass: labels and entries ---------------------------------
 
@@ -235,7 +134,7 @@ class Builtin:
         if bit(i, 24):
           self.entry(a + 4)
         if self.inside(target):
-          self.group.labels.add(target)
+          self.labels.add(target)
       elif (t == 0 and bits(i, 24, 20) == 0x12 and bits(i, 7, 4) == 3):
         self.entry(a + 4)  # blx rm
       elif t == 1 and bits(i, 15, 12) != 15 and bits(i, 19, 16) == 15:
@@ -259,8 +158,80 @@ class Builtin:
 
   def entry(self, off):
     if self.inside(off) and off % 4 == 0:
-      self.group.entries.add(off)
-      self.group.labels.add(off)
+      self.entries.add(off)
+      self.labels.add(off)
+
+  # --- the second pass: C++ -----------------------------------------------
+
+  def emit(self):
+    out = []
+    w = out.append
+    ops = []
+    for a in range(self.start, self.end, 4):
+      try:
+        body = self.translate(a, self.word(a))
+      except Unsupported:
+        body = None
+      ops.append((a, self.word(a), body))
+    # the flags it uses (the registers are its arguments)
+    text = "".join(body for _, _, body in ops if body)
+    flags = [f for f in "NZCV" if re.search(r"\b%s\b" % f, text)]
+    wflags = [f for f in "NZCV" if re.search(r"\b%s = " % f, text)]
+    line = lambda ss: "  %s\n" % " ".join(ss) if ss else ""
+    load = line(["%s = *P%s;" % (f, f) for f in flags])
+    save = line(["*P%s = %s;" % (f, f) for f in wflags])
+    # after a native call: the registers from the state, where the callee
+    # left them (v8_arm_xlate_next saved them), and the flags
+    reload = ("  " + " ".join("r%d = (uint32_t)R[%d];" % (n, n) for n in range(15)) +
+              "\n" + load)
+    w("// %s\n" % self.name)
+    w("XL_TAIL uint32_t xb_%d(State* s, uint32_t pc, XL_PARAMS) {\n" % self.index)
+    w("  const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;\n")
+    # (the state's pointers in locals: V8 compiles without strict aliasing,
+    # so through s they'd be reloaded after every store)
+    w("  int32_t* const R = s->r;\n"
+      "  bool *const PN = s->n, *const PZ = s->z, *const PC = s->c, "
+      "*const PV = s->v;\n")
+    if flags:
+      w("  uint32_t %s;\n" % ", ".join(flags))
+    w(load)
+    w("  uint32_t npc, ct, cr;\n")
+    w("top:\n  switch (pc - B) {\n")
+    for e in sorted(self.entries):
+      w("    case 0x%x: goto L%x;\n" % (e, e))
+    w("    default: npc = pc; goto fb;\n  }\n")
+    for a, word, body in ops:
+      if a in self.labels:
+        w("L%x:\n" % a)
+      if body is None:
+        w("  npc = B + 0x%x; goto fb;  // %08x\n" % (a, word))
+      else:
+        w(body)
+    w("  npc = B + 0x%x; goto jmp;\n" % self.end)  # falling off its end
+    # a computed jump: back to the entry switch if it stays here
+    w("jmp:\n  if (npc - B - 0x%x < 0x%x && npc != s->ret) { pc = npc; goto top; }\n"
+      % (self.start, self.end - self.start))
+    # leaving: the next builtin, tail-called (v8_arm_xlate_next's lookup,
+    # inline; it does the rest)
+    w("out:\n" + save + "  if (npc != s->ret) {\n"
+      "    uint32_t offset = npc - B;\n"
+      "    if (offset < v8_arm_xlate_blob_size) {\n"
+      "      Function f = s->functions[v8_arm_xlate_index[offset >> 5]];\n"
+      "      if (f) [[clang::musttail]] return f(s, npc, %s);\n"
+      "    }\n  }\n" % ARGS)
+    w("  [[clang::musttail]] return v8_arm_xlate_next(s, npc, %s);\n" % ARGS)
+    # an instruction for the simulator
+    w("fb:\n" + save +
+      "  [[clang::musttail]] return v8_arm_xlate_unwind(s, npc, %s);\n" % ARGS)
+    # a call (bl, blx; r14 set): native, unless too deep (then a jump: the
+    # callee returns through the dispatch)
+    w("call:\n  if (s->depth >= kMaxDepth) { npc = ct; goto out; }\n" + save +
+      "  {\n    uint32_t outer = s->ret;\n    s->ret = cr; s->depth++;\n"
+      "    uint32_t r = v8_arm_xlate_next(s, ct, %s);\n"
+      "    s->ret = outer; s->depth--;\n"
+      "    if (r != cr || s->unwind) return r;\n  }\n" % ARGS)
+    w(reload + "  npc = cr; goto jmp;\n}\n\n")
+    return "".join(out)
 
   # Translates one instruction, as the simulator decodes it: C++ statements,
   # or Unsupported. dry: just whether it's supported.
@@ -833,9 +804,8 @@ class Builtin:
     raise Unsupported
 
 
-# the registers passed as arguments (simulator-arm-xlate.h: XL_PARAMS)
-PARAM_REGS = list(range(15))
-ARGS = ", ".join("r%d" % n for n in PARAM_REGS)
+# the registers, as the translated functions' arguments (XL_PARAMS)
+ARGS = ", ".join("r%d" % n for n in range(15))
 
 NEXT = """
 XL_TAIL uint32_t v8_arm_xlate_unwind(State* s, uint32_t pc, XL_PARAMS) {
@@ -864,8 +834,8 @@ extern "C" uint32_t v8_arm_xlate_enter(State* s, uint32_t pc) {
   return v8_arm_xlate_next(s, pc, %(load)s);
 }
 """ % {"args": ARGS,
-       "save": "int32_t* R = s->r; " + " ".join("R[%d] = r%d;" % (n, n) for n in PARAM_REGS),
-       "load": ", ".join("(uint32_t)R[%d]" % n for n in PARAM_REGS)}
+       "save": "int32_t* R = s->r; " + " ".join("R[%d] = r%d;" % (n, n) for n in range(15)),
+       "load": ", ".join("(uint32_t)R[%d]" % n for n in range(15))}
 
 
 def main():
@@ -882,35 +852,28 @@ def main():
             '#pragma clang diagnostic ignored "-Wunused-but-set-variable"\n'
             '#pragma clang diagnostic ignored "-Wsometimes-uninitialized"\n'
             'namespace v8_arm_xlate {\n')
-  # each builtin alone (as one function, the bytecode handlers ran twice
-  # as slow: too big a function, for clang and for the wasm engine both)
-  groups = [Group(k, [b]) for k, b in enumerate(builtins)]
+  # each builtin a function of its own (the bytecode handlers as one ran
+  # twice as slow: too big a function, for clang and the wasm engine both)
   # shards of about equal size
   per = (len(code) + shards - 1) // shards
   files = [[] for _ in range(shards)]
-  for g in groups:
-    files[min(g.members[0].start // per, shards - 1)].append(g)
-  for k, gs in enumerate(files):
+  for b in builtins:
+    files[min(b.start // per, shards - 1)].append(b)
+  for k, bs in enumerate(files):
     with open("%s-%d.cc" % (prefix, k), "w") as f:
       f.write(header)
-      for g in gs:
-        for b in g.members:
-          b.scan()
-        f.write(g.emit())
+      for b in bs:
+        b.scan()
+        f.write(b.emit())
       f.write("}  // namespace v8_arm_xlate\n")
   with open("%s-table.cc" % prefix, "w") as f:
     f.write(header)
-    for g in groups:
-      f.write("XL_TAIL uint32_t xg_%d(State*, uint32_t, XL_PARAMS);\n" % g.index)
+    for b in builtins:
+      f.write("XL_TAIL uint32_t xb_%d(State*, uint32_t, XL_PARAMS);\n" % b.index)
     f.write('extern "C" const Builtin v8_arm_xlate_builtins[] = {\n')
     for b in builtins:
-      f.write('  {0x%x, 0x%x, xg_%d, "%s"},\n' % (b.start, b.end - b.start,
-                                                 b.group.index, b.name))
-    f.write("};\n")
-    f.write('extern "C" const uint16_t v8_arm_xlate_group[] = {\n')
-    for k in range(0, len(builtins), 16):
-      f.write("  %s,\n" % ", ".join(str(b.group.index)
-                                    for b in builtins[k:k + 16]))
+      f.write('  {0x%x, 0x%x, xb_%d, "%s"},\n' % (b.start, b.end - b.start,
+                                                 b.index, b.name))
     f.write("};\n")
     f.write('extern "C" const uint32_t v8_arm_xlate_builtin_count = %d;\n' %
             len(builtins))

@@ -7,12 +7,14 @@
 // V8 has no wasm target; on a wasm32 host it runs ARM code in its simulator.
 // tools/arm-to-c.py translates each builtin of the embedded blob (the final
 // ARM instructions, as mksnapshot wrote them in embedded.S) into a C++
-// function over the simulator's own machine state: the registers and flags
-// in locals while it runs, the stack and frames in memory, return addresses
-// still addresses in the blob. The simulator's loop calls a builtin's
-// function for a program counter at one of its entries, and simulates what
-// the translation leaves out (calls into C++, which go through the
-// simulator's redirection, and instructions it doesn't translate).
+// function over the simulator's own machine state: the registers in wasm
+// locals while it runs, the stack and frames in memory, return addresses
+// still addresses in the blob. A builtin goes on to the next by a tail call,
+// and calls (bl, blx) are native calls. What the translation leaves out
+// (calls into C++, which go through the simulator's redirection, and
+// instructions it doesn't translate) returns all of the translated code to
+// the simulator's loop, which simulates the instruction and enters the
+// translated code again after it.
 //
 // This header is the runtime of the translated code, and the interface
 // between it and the simulator: no V8 headers, so the translated code
@@ -36,7 +38,7 @@ struct State;
 // throughout. (Just the interpreter's own, from one bytecode to the next,
 // with the rest in the state: slower, the state's stores costing more than
 // the arguments.) The flags stay in the state, each function loading and
-// saving them if it uses them. (tools/arm-to-c.py's PARAM_REGS: the same.)
+// saving them if it uses them.
 #define XL_PARAMS                                                            \
   uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t r4,           \
       uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9,       \
@@ -90,15 +92,6 @@ extern "C" const uint32_t v8_arm_xlate_builtin_count;
 extern "C" const uint16_t v8_arm_xlate_index[];
 extern "C" const unsigned char v8_Default_embedded_blob_code_[];
 extern "C" const uint32_t v8_arm_xlate_blob_size;
-// each builtin's group: the builtins translated as one function
-extern "C" const uint16_t v8_arm_xlate_group[];
-
-// whether an offset in the blob is in a group's builtins
-inline bool in_group(uint32_t offset, uint32_t group) {
-  return offset < v8_arm_xlate_blob_size &&
-         v8_arm_xlate_group[v8_arm_xlate_index[offset >> 5]] == group;
-}
-
 // Goes on from pc: tail-calls the function of the builtin there; or saves
 // the registers to the state and returns, at the innermost native call's
 // return address (s->ret), the simulator's end, or for the simulator
