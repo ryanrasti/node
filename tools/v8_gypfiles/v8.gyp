@@ -535,6 +535,47 @@
             'abseil.gyp:abseil',
           ]
         }],
+        # linux-workers: for a wasm compiler, the builtins also as C++, which
+        # the ARM simulator runs where it can (tools/arm-to-c.py)
+        ['target_arch=="wasm32"', {
+          'actions': [
+            {
+              'action_name': 'arm_to_c',
+              'message': 'generating: >@(_outputs)',
+              'inputs': [
+                '<(V8_ROOT)/tools/arm-to-c.py',
+                '<(INTERMEDIATE_DIR)/embedded.S',
+              ],
+              'outputs': [
+                '<(INTERMEDIATE_DIR)/embedded-c-0.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-1.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-2.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-3.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-4.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-5.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-6.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-7.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-8.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-9.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-10.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-11.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-12.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-13.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-14.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-15.cc',
+                '<(INTERMEDIATE_DIR)/embedded-c-table.cc',
+              ],
+              'process_outputs_as_sources': 1,
+              'action': [
+                '<(python)',
+                '<(V8_ROOT)/tools/arm-to-c.py',
+                '<(INTERMEDIATE_DIR)/embedded.S',
+                '<(INTERMEDIATE_DIR)/embedded-c',
+                '16',
+              ],
+            },
+          ],
+        }],
         ['OS=="win" and clang==1', {
           'actions': [
             {

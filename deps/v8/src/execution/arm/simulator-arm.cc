@@ -4,6 +4,13 @@
 
 #include "src/execution/arm/simulator-arm.h"
 #include "src/execution/simulator-c-thunks.h"
+#if V8_HOST_ARCH_WASM32
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
+
+#include "src/execution/arm/simulator-arm-xlate.h"
+#endif
 
 #include "src/base/logging.h"
 
@@ -6232,7 +6239,141 @@ void Simulator::InstructionDecode(Instruction* instr) {
   }
 }
 
+#if V8_HOST_ARCH_WASM32
+namespace {
+
+// the translated builtins (simulator-arm-xlate.h): on unless V8_ARM_XLATE=0;
+// V8_ARM_XLATE_ONLY=<first>:<last> limits them to a range of builtins (in
+// blob order: to bisect); V8_ARM_XLATE_STATS=1 counts, at exit, the
+// instructions still simulated and where
+struct Xlate {
+  bool enabled = true;
+  bool stats = false;
+  uint32_t first = 0, last = UINT32_MAX;
+  uint64_t calls = 0, simulated = 0;
+  std::unordered_map<uint32_t, uint64_t>* simulated_at = nullptr;
+
+  Xlate() {
+    if (const char* e = getenv("V8_ARM_XLATE")) enabled = strcmp(e, "0") != 0;
+    if (const char* e = getenv("V8_ARM_XLATE_ONLY")) {
+      sscanf(e, "%u:%u", &first, &last);
+    }
+    if (const char* e = getenv("V8_ARM_XLATE_STATS")) {
+      stats = strcmp(e, "0") != 0;
+      simulated_at = new std::unordered_map<uint32_t, uint64_t>();
+      atexit([] { Get().Report(); });
+    }
+  }
+  static Xlate& Get() {
+    static Xlate* xlate = new Xlate();
+    return *xlate;
+  }
+
+  // the builtin at an offset in the blob, or its index's complement
+  static int Find(uint32_t offset) {
+    int lo = 0, hi = v8_arm_xlate::v8_arm_xlate_builtin_count - 1;
+    while (lo <= hi) {
+      int mid = (lo + hi) / 2;
+      const v8_arm_xlate::Builtin& b = v8_arm_xlate::v8_arm_xlate_builtins[mid];
+      if (offset < b.start) {
+        hi = mid - 1;
+      } else if (offset >= b.start + b.size) {
+        lo = mid + 1;
+      } else {
+        return mid;
+      }
+    }
+    return -1;
+  }
+
+  void Report() {
+    const uint32_t blob = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+        v8_arm_xlate::v8_Default_embedded_blob_code_));
+    fprintf(stderr, "arm-xlate: %llu calls, %llu instructions simulated\n",
+            static_cast<unsigned long long>(calls),
+            static_cast<unsigned long long>(simulated));
+    std::vector<std::pair<uint64_t, uint32_t>> top;
+    for (auto& [pc, n] : *simulated_at) top.push_back({n, pc});
+    std::sort(top.rbegin(), top.rend());
+    for (size_t k = 0; k < top.size() && k < 40; k++) {
+      uint32_t pc = top[k].second;
+      int b = Find(pc - blob);
+      if (b >= 0) {
+        const v8_arm_xlate::Builtin& builtin =
+            v8_arm_xlate::v8_arm_xlate_builtins[b];
+        fprintf(stderr, "  %10llu  %s+0x%x  %08x\n",
+                static_cast<unsigned long long>(top[k].first), builtin.name,
+                pc - blob - builtin.start,
+                *reinterpret_cast<uint32_t*>(pc));
+      } else {
+        fprintf(stderr, "  %10llu  0x%08x (outside the blob)\n",
+                static_cast<unsigned long long>(top[k].first), pc);
+      }
+    }
+  }
+};
+
+}  // namespace
+
+void Simulator::ExecuteTranslated() {
+  Xlate& xlate = Xlate::Get();
+  const uint32_t blob = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+      v8_arm_xlate::v8_Default_embedded_blob_code_));
+  CHECK_EQ(blob, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+                     isolate_->embedded_blob_code())));
+  const uint32_t blob_size = isolate_->embedded_blob_code_size();
+  static_assert(sizeof(FPSCR_rounding_mode_) == sizeof(int32_t));
+  v8_arm_xlate::State state = {
+      registers_,
+      &n_flag_,
+      &z_flag_,
+      &c_flag_,
+      &v_flag_,
+      vfp_registers_,
+      &n_flag_FPSCR_,
+      &z_flag_FPSCR_,
+      &c_flag_FPSCR_,
+      &v_flag_FPSCR_,
+      &FPSCR_default_NaN_mode_,
+      reinterpret_cast<int32_t*>(&FPSCR_rounding_mode_),
+      &inv_op_vfp_flag_,
+      &div_zero_vfp_flag_,
+      &overflow_vfp_flag_,
+      &underflow_vfp_flag_,
+      &inexact_vfp_flag_,
+      false};
+  uint32_t pc = get_pc();
+  while (pc != static_cast<uint32_t>(end_sim_pc)) {
+    uint32_t offset = pc - blob;
+    if (offset < blob_size) {
+      int b = Xlate::Find(offset);
+      if (b >= 0 && static_cast<uint32_t>(b) >= xlate.first &&
+          static_cast<uint32_t>(b) <= xlate.last) {
+        state.fallback = false;
+        xlate.calls++;
+        pc = v8_arm_xlate::v8_arm_xlate_builtins[b].function(&state, pc);
+        set_pc(pc);
+        if (!state.fallback) continue;
+      }
+    }
+    // the instruction at pc, simulated
+    if (xlate.stats) {
+      xlate.simulated++;
+      (*xlate.simulated_at)[pc]++;
+    }
+    icount_ = base::AddWithWraparound(icount_, 1);
+    InstructionDecode(reinterpret_cast<Instruction*>(pc));
+    pc = get_pc();
+  }
+}
+#endif  // V8_HOST_ARCH_WASM32
+
 void Simulator::Execute() {
+#if V8_HOST_ARCH_WASM32
+  if (Xlate::Get().enabled && v8_flags.stop_sim_at == 0) {
+    return ExecuteTranslated();
+  }
+#endif
   // Get the PC to simulate. Cannot use the accessor here as we need the
   // raw PC value and not the one used as input to arithmetic instructions.
   int program_counter = get_pc();

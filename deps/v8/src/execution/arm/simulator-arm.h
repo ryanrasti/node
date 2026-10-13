@@ -252,6 +252,11 @@ class Simulator : public SimulatorBase {
 
   // Executes ARM instructions until the PC reaches end_sim_pc.
   void Execute();
+#if V8_HOST_ARCH_WASM32
+  // the loop, running the builtins translated to C where it can
+  // (simulator-arm-xlate.h)
+  void ExecuteTranslated();
+#endif
 
   template <typename Return, typename... Args>
   Return Call(Address entry, Args... args) {
