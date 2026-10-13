@@ -11,7 +11,7 @@
 #if HAVE_OPENSSL
 #include <openssl/crypto.h>
 #include <quic/guard.h>
-#ifndef OPENSSL_NO_QUIC
+#if HAVE_OPENSSL && !defined(OPENSSL_NO_QUIC)
 #include <openssl/quic.h>
 #endif
 #endif  // HAVE_OPENSSL

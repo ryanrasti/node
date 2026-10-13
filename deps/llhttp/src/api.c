@@ -39,7 +39,9 @@ void llhttp_init(llhttp_t* parser, llhttp_type_t type,
 }
 
 
-#if defined(__wasm__)
+// (the JS-hosted wasm build, whose callbacks JS provides: not wasm Linux's,
+// which links llhttp as C. linux-workers)
+#if defined(__wasm__) && !defined(__linux__)
 
 extern int wasm_on_message_begin(llhttp_t * p);
 extern int wasm_on_url(llhttp_t* p, const char* at, size_t length);

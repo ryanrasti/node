@@ -894,6 +894,10 @@ V8 shared library set USING_V8_SHARED.
 #elif __riscv_xlen == 32
 #define V8_TARGET_ARCH_RISCV32 1
 #endif
+#elif defined(__wasm32__)
+// linux-workers: on a wasm32 host, V8's target is ARM, which its simulator
+// runs (for embedders' code too, which the build doesn't tell)
+#define V8_TARGET_ARCH_ARM 1
 #else
 #error Target architecture was not detected as supported by v8
 #endif

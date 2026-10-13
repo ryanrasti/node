@@ -31,12 +31,12 @@
 #if HAVE_OPENSSL
 #include <openssl/crypto.h>
 #include "ncrypto.h"
-#ifndef OPENSSL_NO_QUIC
+#if HAVE_OPENSSL && !defined(OPENSSL_NO_QUIC)
 #include <openssl/quic.h>
 #endif
 #endif  // HAVE_OPENSSL
 
-#ifndef OPENSSL_NO_QUIC
+#if HAVE_OPENSSL && !defined(OPENSSL_NO_QUIC)
 #include <ngtcp2/version.h>
 #include <nghttp3/version.h>
 #endif
@@ -148,7 +148,7 @@ Metadata::Versions::Versions() {
   unicode = U_UNICODE_VERSION;
 #endif  // NODE_HAVE_I18N_SUPPORT
 
-#ifndef OPENSSL_NO_QUIC
+#if HAVE_OPENSSL && !defined(OPENSSL_NO_QUIC)
   ngtcp2 = NGTCP2_VERSION;
   nghttp3 = NGHTTP3_VERSION;
 #endif

@@ -786,8 +786,11 @@ static ExitCode ProcessGlobalArgsInternal(std::vector<std::string>* args,
     v8_args.emplace_back("--js-source-phase-imports");
   }
 
-  // WebAssembly JS Promise Integration
+  // WebAssembly JS Promise Integration (a V8 without WebAssembly, in lite
+  // mode, has no such flag: it would fail to start)
+#ifndef NODE_V8_LITE_MODE
   v8_args.emplace_back("--experimental-wasm-jspi");
+#endif
 
 #ifdef __POSIX__
   // Block SIGPROF signals when sleeping in epoll_wait/kevent/etc.  Avoids the

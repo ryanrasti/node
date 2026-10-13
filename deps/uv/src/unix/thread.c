@@ -135,6 +135,23 @@ int uv_thread_detach(uv_thread_t *tid) {
 }
 
 
+#if defined(__wasm__)
+/* wasm checks an indirect call's signature: pthread_create needs a real
+ * void* (*)(void*), not entry cast to one (linux-workers) */
+struct uv__thread_start_args {
+  void (*entry)(void*);
+  void* arg;
+};
+
+static void* uv__thread_start(void* p) {
+  struct uv__thread_start_args args = *(struct uv__thread_start_args*) p;
+  uv__free(p);
+  args.entry(args.arg);
+  return NULL;
+}
+#endif
+
+
 int uv_thread_create_ex(uv_thread_t* tid,
                         const uv_thread_options_t* params,
                         void (*entry)(void *arg),
@@ -177,8 +194,20 @@ int uv_thread_create_ex(uv_thread_t* tid,
       abort();
   }
 
+#if defined(__wasm__)
+  struct uv__thread_start_args* start = uv__malloc(sizeof(*start));
+  if (start == NULL)
+    abort();
+  start->entry = entry;
+  start->arg = arg;
+  (void) f;
+  err = pthread_create(tid, attr, uv__thread_start, start);
+  if (err)
+    uv__free(start);
+#else
   f.in = entry;
   err = pthread_create(tid, attr, f.out, arg);
+#endif
 
   if (attr != NULL)
     pthread_attr_destroy(attr);

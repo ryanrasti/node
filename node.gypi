@@ -26,6 +26,10 @@
   },
 
   'conditions': [
+    # V8 without WebAssembly (lite mode): no wasm flags for it (linux-workers)
+    [ 'v8_enable_lite_mode==1', {
+      'defines': [ 'NODE_V8_LITE_MODE' ],
+    }],
     [ 'clang==1', {
       'cflags': [
         '-Werror=undefined-inline',
