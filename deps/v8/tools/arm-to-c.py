@@ -88,20 +88,113 @@ class Unsupported(Exception):
   pass
 
 
+class Group:
+  """Builtins translated as one function: jumps and calls between them are
+  gotos (the bytecode handlers' dispatch, above all)."""
+
+  def __init__(self, index, members):
+    self.index = index  # its function: xg_<index>
+    self.members = members
+    self.labels = set()  # offsets that need a label
+    self.entries = set()  # offsets the entry switch reaches
+    for b in members:
+      b.group = self
+      self.labels.add(b.start)
+      self.entries.add(b.start)
+
+  def contains(self, off):
+    return any(b.start <= off < b.end for b in self.members)
+
+  def emit(self):
+    out = []
+    w = out.append
+    ops = []
+    for b in self.members:
+      for a in range(b.start, b.end, 4):
+        try:
+          body = b.translate(a, b.word(a))
+        except Unsupported:
+          body = None
+        ops.append((a, b.word(a), body))
+      ops.append((b.end, None, None))  # falling off its end
+    # the registers and flags it uses (the rest stay in the state)
+    text = "".join(body for _, _, body in ops if body)
+    calls = "goto call" in text
+    regs = sorted({int(n) for n in re.findall(r"\br(\d+)\b", text)} |
+                  ({14} if calls else set()))
+    written = sorted({int(n) for n in re.findall(r"\br(\d+) = ", text)} |
+                     ({14} if calls else set()))
+    flags = [f for f in "NZCV" if re.search(r"\b%s\b" % f, text)]
+    wflags = [f for f in "NZCV" if re.search(r"\b%s = " % f, text)]
+    load = ("  " + " ".join("r%d = (uint32_t)R[%d];" % (n, n) for n in regs) +
+            " " + " ".join("%s = *P%s;" % (f, f) for f in flags) + "\n")
+    save = ("  " + " ".join("R[%d] = (int32_t)r%d;" % (n, n) for n in written) +
+            " " + " ".join("*P%s = %s;" % (f, f) for f in wflags) + "\n")
+    for b in self.members:
+      w("// %s\n" % b.name)
+    w("TAIL uint32_t xg_%d(State* s, uint32_t pc) {\n" % self.index)
+    w("  const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;\n")
+    # (the state's pointers in locals: V8 compiles without strict aliasing,
+    # so through s they'd be reloaded after every store)
+    w("  int32_t* const R = s->r;\n"
+      "  bool *const PN = s->n, *const PZ = s->z, *const PC = s->c, "
+      "*const PV = s->v;\n")
+    w("  uint32_t r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, "
+      "r14, N, Z, C, V;\n")
+    w(load)
+    w("  uint32_t npc, ct, cr;\n")
+    w("top:\n  switch (pc - B) {\n")
+    for e in sorted(self.entries):
+      w("    case 0x%x: goto L%x;\n" % (e, e))
+    w("    default: npc = pc; goto fb;\n  }\n")
+    for a, word, body in ops:
+      if word is None:
+        w("  npc = B + 0x%x; goto jmp;\n" % a)
+        continue
+      if a in self.labels:
+        w("L%x:\n" % a)
+      if body is None:
+        w("  npc = B + 0x%x; goto fb;  // %08x\n" % (a, word))
+      else:
+        w(body)
+    # a computed jump: back to the entry switch if it stays here
+    if len(self.members) == 1:
+      b = self.members[0]
+      inside = "npc - B - 0x%x < 0x%x" % (b.start, b.end - b.start)
+      inside_ct = "false"
+    else:
+      inside = "in_group(npc - B, %d)" % self.index
+      inside_ct = "in_group(ct - B, %d)" % self.index
+    w("jmp:\n  if (npc == s->ret) goto out;\n"
+      "  if (%s) { pc = npc; goto top; }\n" % inside)
+    # leaving: v8_arm_xlate_next goes on from npc
+    w("out:\n" + save + "  return npc;\n")
+    # an instruction for the simulator
+    w("fb:\n" + save + "  npc = s->step(s, npc);\n" + load + "  goto jmp;\n")
+    # a call (bl, blx; r14 set): a goto in the group; else native, unless
+    # too deep
+    w("call:\n  if (%s) { pc = ct; goto top; }\n" % inside_ct + save)
+    w("  if (s->depth >= kMaxDepth) return ct;\n"
+      "  {\n    uint32_t outer = s->ret;\n    s->ret = cr; s->depth++;\n"
+      "    uint32_t r = v8_arm_xlate_next(s, ct);\n"
+      "    s->ret = outer; s->depth--;\n    if (r != cr) return r;\n  }\n")
+    w(load + "  npc = cr; goto jmp;\n}\n\n")
+    return "".join(out)
+
+
 class Builtin:
   """One builtin's translation."""
 
   def __init__(self, index, name, start, end, code):
     self.index, self.name, self.start, self.end = index, name, start, end
     self.code = code  # the whole blob
-    self.labels = {start}  # offsets that need a label
-    self.entries = {start}  # offsets the entry switch reaches
+    self.group = None
 
   def word(self, off):
     return int.from_bytes(self.code[off:off + 4], "little")
 
-  def inside(self, off):
-    return self.start <= off < self.end
+  def inside(self, off):  # in its group
+    return self.group.contains(off)
 
   # --- the first pass: labels and entries ---------------------------------
 
@@ -109,6 +202,8 @@ class Builtin:
     for a in range(self.start, self.end, 4):
       i = self.word(a)
       cond = i >> 28
+      if i == 0xCCCCCCCC:
+        continue  # padding
       try:
         self.translate(a, i, dry=True)
         ok = True
@@ -125,7 +220,7 @@ class Builtin:
         if bit(i, 24):
           self.entry(a + 4)
         if self.inside(target):
-          self.labels.add(target)
+          self.group.labels.add(target)
       elif (t == 0 and bits(i, 24, 20) == 0x12 and bits(i, 7, 4) == 3):
         self.entry(a + 4)  # blx rm
       elif t == 1 and bits(i, 15, 12) != 15 and bits(i, 19, 16) == 15:
@@ -140,7 +235,7 @@ class Builtin:
             bits(i, 15, 12) == 15 and not bit(i, 4)):
         # add pc, pc, rm, lsl #2: a table of branches follows
         k = a + 8
-        while self.inside(k) and self.word(k) >> 24 == 0xEA:
+        while self.start <= k < self.end and self.word(k) >> 24 == 0xEA:
           self.entry(k)
           k += 4
       elif (t == 0 and bits(i, 24, 21) == 13 and bits(i, 3, 0) == 15 and
@@ -149,48 +244,8 @@ class Builtin:
 
   def entry(self, off):
     if self.inside(off) and off % 4 == 0:
-      self.entries.add(off)
-      self.labels.add(off)
-
-  # --- the second pass: C++ -----------------------------------------------
-
-  def emit(self):
-    out = []
-    w = out.append
-    ops = []
-    for a in range(self.start, self.end, 4):
-      try:
-        body = self.translate(a, self.word(a))
-      except Unsupported:
-        body = None
-      ops.append((a, body))
-    w("// %s\n" % self.name)
-    w("uint32_t xb_%d(State* s, uint32_t pc) {\n" % self.index)
-    w("  const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;\n")
-    w("  uint32_t " + ", ".join("r%d = (uint32_t)s->r[%d]" % (n, n)
-                                 for n in range(15)) + ";\n")
-    w("  uint32_t N = *s->n, Z = *s->z, C = *s->c, V = *s->v;\n")
-    w("  uint32_t npc;\n")
-    w("top:\n  switch (pc - B) {\n")
-    for e in sorted(self.entries):
-      w("    case 0x%x: goto L%x;\n" % (e, e))
-    w("    default: npc = pc; goto fb;\n  }\n")
-    for a, body in ops:
-      if a in self.labels:
-        w("L%x:\n" % a)
-      if body is None:
-        w("  npc = B + 0x%x; goto fb;  // %08x\n" % (a, self.word(a)))
-      else:
-        w(body)
-    w("  npc = B + 0x%x; goto out;\n" % self.end)
-    w("jmp:\n  if (npc - B - 0x%x < 0x%x) { pc = npc; goto top; }\n"
-      "  goto out;\n" % (self.start, self.end - self.start))
-    w("fb:\n  s->fallback = true;\nout:\n")
-    w("  " + " ".join("s->r[%d] = (int32_t)r%d;" % (n, n)
-                      for n in range(15)) + "\n")
-    w("  *s->n = N; *s->z = Z; *s->c = C; *s->v = V;\n")
-    w("  return npc;\n}\n\n")
-    return "".join(out)
+      self.group.entries.add(off)
+      self.group.labels.add(off)
 
   # Translates one instruction, as the simulator decodes it: C++ statements,
   # or Unsupported. dry: just whether it's supported.
@@ -425,9 +480,8 @@ class Builtin:
       if op == 1:  # bx
         return self.W(15, self.R(rm))
       if op == 3:  # blx
-        s = "{ uint32_t target = %s; " % self.R(rm)
-        s += "r14 = B + 0x%x; %s }" % (self.a + 4, self.W(15, "target"))
-        return s
+        return "{ ct = %s; r14 = cr = B + 0x%x; goto call; }" % (
+            self.R(rm), self.a + 4)
       raise Unsupported
     if bits(i, 22, 21) == 3 and bits(i, 7, 4) == 1:  # clz
       return self.W(bits(i, 15, 12), "clz(%s)" % self.R(rm))
@@ -553,12 +607,14 @@ class Builtin:
     target = self.a + 8 + off * 4
     if not 0 <= target < len(self.code):
       raise Unsupported  # data, not a branch
-    s = ""
-    if bit(i, 24):
-      s = "r14 = B + 0x%x; " % (self.a + 4)
-    if self.inside(target) and not bit(i, 24):
-      return s + "goto L%x;" % target
-    return s + "{ npc = B + 0x%x; goto out; }" % target
+    if bit(i, 24):  # bl
+      if self.inside(target):
+        return "{ r14 = B + 0x%x; goto L%x; }" % (self.a + 4, target)
+      return "{ ct = B + 0x%x; r14 = cr = B + 0x%x; goto call; }" % (
+          target, self.a + 4)
+    if self.inside(target):
+      return "goto L%x;" % target
+    return "{ npc = B + 0x%x; goto out; }" % target
 
   # --- VFP ----------------------------------------------------------------
 
@@ -762,6 +818,27 @@ class Builtin:
     raise Unsupported
 
 
+NEXT = """
+TAIL uint32_t v8_arm_xlate_next(State* s, uint32_t pc) {
+  const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;
+  for (;;) {
+    if (pc == s->ret) return pc;
+    uint32_t offset = pc - B;
+    if (offset < v8_arm_xlate_blob_size) {
+      Function f = s->functions[v8_arm_xlate_index[offset >> 5]];
+      if (f) {
+        pc = f(s, pc);
+        continue;
+      }
+    } else if (pc >= 0xFFFFFFFEu) {
+      return pc;  // the simulator's end (end_sim_pc), or bad_lr
+    }
+    pc = s->step(s, pc);
+  }
+}
+"""
+
+
 def main():
   src, prefix, shards = sys.argv[1], sys.argv[2], int(sys.argv[3])
   code, named = parse_embedded(src)
@@ -774,32 +851,52 @@ def main():
             '#pragma clang diagnostic ignored "-Wunused-label"\n'
             '#pragma clang diagnostic ignored "-Wunused-variable"\n'
             '#pragma clang diagnostic ignored "-Wunused-but-set-variable"\n'
+            '#pragma clang diagnostic ignored "-Wsometimes-uninitialized"\n'
+            '#define TAIL extern "C"\n'
             'namespace v8_arm_xlate {\n')
+  # each builtin alone (as one function, the bytecode handlers ran twice
+  # as slow: too big a function, for clang and for the wasm engine both)
+  groups = [Group(k, [b]) for k, b in enumerate(builtins)]
   # shards of about equal size
   per = (len(code) + shards - 1) // shards
   files = [[] for _ in range(shards)]
-  for b in builtins:
-    files[min(b.start // per, shards - 1)].append(b)
-  total = fallbacks = 0
-  for k, bs in enumerate(files):
+  for g in groups:
+    files[min(g.members[0].start // per, shards - 1)].append(g)
+  for k, gs in enumerate(files):
     with open("%s-%d.cc" % (prefix, k), "w") as f:
       f.write(header)
-      for b in bs:
-        b.scan()
-        f.write("uint32_t xb_%d(State*, uint32_t);\n" % b.index)
-        f.write(b.emit())
+      for g in gs:
+        for b in g.members:
+          b.scan()
+        f.write(g.emit())
       f.write("}  // namespace v8_arm_xlate\n")
   with open("%s-table.cc" % prefix, "w") as f:
     f.write(header)
-    for b in builtins:
-      f.write("uint32_t xb_%d(State*, uint32_t);\n" % b.index)
+    for g in groups:
+      f.write("TAIL uint32_t xg_%d(State*, uint32_t);\n" % g.index)
     f.write('extern "C" const Builtin v8_arm_xlate_builtins[] = {\n')
     for b in builtins:
-      f.write('  {0x%x, 0x%x, xb_%d, "%s"},\n' % (b.start, b.end - b.start,
-                                                 b.index, b.name))
+      f.write('  {0x%x, 0x%x, xg_%d, "%s"},\n' % (b.start, b.end - b.start,
+                                                 b.group.index, b.name))
+    f.write("};\n")
+    f.write('extern "C" const uint16_t v8_arm_xlate_group[] = {\n')
+    for k in range(0, len(builtins), 16):
+      f.write("  %s,\n" % ", ".join(str(b.group.index)
+                                    for b in builtins[k:k + 16]))
     f.write("};\n")
     f.write('extern "C" const uint32_t v8_arm_xlate_builtin_count = %d;\n' %
             len(builtins))
+    f.write('extern "C" const uint32_t v8_arm_xlate_blob_size = 0x%x;\n' %
+            len(code))
+    index = []
+    for b in builtins:
+      assert b.start % 32 == 0 and b.end % 32 == 0, b.name
+      index += [b.index] * ((b.end - b.start) // 32)
+    f.write('extern "C" const uint16_t v8_arm_xlate_index[] = {\n')
+    for k in range(0, len(index), 16):
+      f.write("  %s,\n" % ", ".join(str(x) for x in index[k:k + 16]))
+    f.write("};\n")
+    f.write(NEXT)
     f.write("}  // namespace v8_arm_xlate\n")
 
 

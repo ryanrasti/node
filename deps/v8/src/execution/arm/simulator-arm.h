@@ -256,6 +256,8 @@ class Simulator : public SimulatorBase {
   // the loop, running the builtins translated to C where it can
   // (simulator-arm-xlate.h)
   void ExecuteTranslated();
+  // simulates the instruction at pc, for the translated code
+  uint32_t XlateStep(uint32_t pc);
 #endif
 
   template <typename Return, typename... Args>

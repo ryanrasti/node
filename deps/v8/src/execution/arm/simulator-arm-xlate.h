@@ -29,7 +29,13 @@
 
 namespace v8_arm_xlate {
 
-// The simulator's machine state, by pointers into its fields.
+struct State;
+// a translated builtin: runs from pc (an address in the blob) on, returns
+// the pc it leaves it at (to v8_arm_xlate_next)
+using Function = uint32_t (*)(State* s, uint32_t pc);
+
+// The simulator's machine state, by pointers into its fields, and the
+// translated code's own.
 struct State {
   int32_t* r;  // r0..r15
   bool *n, *z, *c, *v;
@@ -38,14 +44,23 @@ struct State {
   bool* default_nan;
   int32_t* rounding_mode;  // FPSCR's RMode (bits 23:22, in place)
   bool *inv_op, *div_zero, *overflow, *underflow, *inexact;
-  // set by a function that returns without running the instruction at the
-  // pc it returns (not an entry, or not translated): simulate it
-  bool fallback;
-};
 
-// a translated builtin: runs from pc (an address in the blob), returns the
-// next pc
-using Function = uint32_t (*)(State* s, uint32_t pc);
+  // simulates the instruction at pc (the machine state saved), returns the
+  // next pc
+  uint32_t (*step)(State* s, uint32_t pc);
+  void* simulator;
+  // each builtin's function, by index (null: simulate it)
+  const Function* functions;
+  // Calls (bl, blx) are native calls, as deep as kMaxDepth: ret is the
+  // return address the innermost one waits for, where execution returns to
+  // it. Its frames hold nothing but where to resume (the machine state is
+  // saved across a call), so a native caller may also resume at its
+  // return address from elsewhere, and an unwinding (a mismatch, too deep)
+  // just returns to the simulator's loop, which goes on from the pc.
+  uint32_t ret;
+  uint32_t depth;
+};
+constexpr uint32_t kMaxDepth = 96;
 
 struct Builtin {
   uint32_t start;  // offset in the blob
@@ -54,10 +69,29 @@ struct Builtin {
   const char* name;
 };
 
-// the translated builtins, in blob order (tools/arm-to-c.py)
+// the translated builtins, in blob order (tools/arm-to-c.py), and for each
+// 32 bytes of the blob (builtins start 32-byte aligned), its builtin
 extern "C" const Builtin v8_arm_xlate_builtins[];
 extern "C" const uint32_t v8_arm_xlate_builtin_count;
+extern "C" const uint16_t v8_arm_xlate_index[];
 extern "C" const unsigned char v8_Default_embedded_blob_code_[];
+extern "C" const uint32_t v8_arm_xlate_blob_size;
+// each builtin's group: the builtins translated as one function
+extern "C" const uint16_t v8_arm_xlate_group[];
+
+// whether an offset in the blob is in a group's builtins
+inline bool in_group(uint32_t offset, uint32_t group) {
+  return offset < v8_arm_xlate_blob_size &&
+         v8_arm_xlate_group[v8_arm_xlate_index[offset >> 5]] == group;
+}
+
+// Runs from pc on: each builtin's function, as far as it goes, then the
+// next one's, simulating what's outside the blob (calls into C++, through
+// the simulator's redirection) or untranslated; returns at the innermost
+// native call's return address (s->ret), or the simulator's end. (Not tail
+// calls between the functions: Asyncify, how a process forks here, has no
+// tail calls.)
+extern "C" uint32_t v8_arm_xlate_next(State* s, uint32_t pc);
 
 // --- the translated code's runtime -----------------------------------------
 

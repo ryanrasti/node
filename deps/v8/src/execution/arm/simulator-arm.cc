@@ -6249,14 +6249,21 @@ namespace {
 struct Xlate {
   bool enabled = true;
   bool stats = false;
-  uint32_t first = 0, last = UINT32_MAX;
-  uint64_t calls = 0, simulated = 0;
+  // each builtin's function; null where V8_ARM_XLATE_ONLY leaves it out
+  std::vector<v8_arm_xlate::Function> functions;
+  uint64_t simulated = 0;
   std::unordered_map<uint32_t, uint64_t>* simulated_at = nullptr;
 
   Xlate() {
     if (const char* e = getenv("V8_ARM_XLATE")) enabled = strcmp(e, "0") != 0;
+    uint32_t first = 0, last = UINT32_MAX;
     if (const char* e = getenv("V8_ARM_XLATE_ONLY")) {
       sscanf(e, "%u:%u", &first, &last);
+    }
+    for (uint32_t b = 0; b < v8_arm_xlate::v8_arm_xlate_builtin_count; b++) {
+      functions.push_back(b >= first && b <= last
+                              ? v8_arm_xlate::v8_arm_xlate_builtins[b].function
+                              : nullptr);
     }
     if (const char* e = getenv("V8_ARM_XLATE_STATS")) {
       stats = strcmp(e, "0") != 0;
@@ -6269,42 +6276,23 @@ struct Xlate {
     return *xlate;
   }
 
-  // the builtin at an offset in the blob, or its index's complement
-  static int Find(uint32_t offset) {
-    int lo = 0, hi = v8_arm_xlate::v8_arm_xlate_builtin_count - 1;
-    while (lo <= hi) {
-      int mid = (lo + hi) / 2;
-      const v8_arm_xlate::Builtin& b = v8_arm_xlate::v8_arm_xlate_builtins[mid];
-      if (offset < b.start) {
-        hi = mid - 1;
-      } else if (offset >= b.start + b.size) {
-        lo = mid + 1;
-      } else {
-        return mid;
-      }
-    }
-    return -1;
-  }
-
   void Report() {
     const uint32_t blob = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
         v8_arm_xlate::v8_Default_embedded_blob_code_));
-    fprintf(stderr, "arm-xlate: %llu calls, %llu instructions simulated\n",
-            static_cast<unsigned long long>(calls),
+    fprintf(stderr, "arm-xlate: %llu instructions simulated\n",
             static_cast<unsigned long long>(simulated));
     std::vector<std::pair<uint64_t, uint32_t>> top;
     for (auto& [pc, n] : *simulated_at) top.push_back({n, pc});
     std::sort(top.rbegin(), top.rend());
     for (size_t k = 0; k < top.size() && k < 40; k++) {
-      uint32_t pc = top[k].second;
-      int b = Find(pc - blob);
-      if (b >= 0) {
+      uint32_t pc = top[k].second, offset = pc - blob;
+      if (offset < v8_arm_xlate::v8_arm_xlate_blob_size) {
         const v8_arm_xlate::Builtin& builtin =
-            v8_arm_xlate::v8_arm_xlate_builtins[b];
+            v8_arm_xlate::v8_arm_xlate_builtins
+                [v8_arm_xlate::v8_arm_xlate_index[offset >> 5]];
         fprintf(stderr, "  %10llu  %s+0x%x  %08x\n",
                 static_cast<unsigned long long>(top[k].first), builtin.name,
-                pc - blob - builtin.start,
-                *reinterpret_cast<uint32_t*>(pc));
+                offset - builtin.start, *reinterpret_cast<uint32_t*>(pc));
       } else {
         fprintf(stderr, "  %10llu  0x%08x (outside the blob)\n",
                 static_cast<unsigned long long>(top[k].first), pc);
@@ -6313,15 +6301,29 @@ struct Xlate {
   }
 };
 
+uint32_t StepFromTranslated(v8_arm_xlate::State* s, uint32_t pc) {
+  return static_cast<Simulator*>(s->simulator)->XlateStep(pc);
+}
+
 }  // namespace
+
+uint32_t Simulator::XlateStep(uint32_t pc) {
+  Xlate& xlate = Xlate::Get();
+  if (xlate.stats) {
+    xlate.simulated++;
+    (*xlate.simulated_at)[pc]++;
+  }
+  icount_ = base::AddWithWraparound(icount_, 1);
+  set_pc(pc);
+  InstructionDecode(reinterpret_cast<Instruction*>(pc));
+  return get_pc();
+}
 
 void Simulator::ExecuteTranslated() {
   Xlate& xlate = Xlate::Get();
-  const uint32_t blob = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
-      v8_arm_xlate::v8_Default_embedded_blob_code_));
-  CHECK_EQ(blob, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
-                     isolate_->embedded_blob_code())));
-  const uint32_t blob_size = isolate_->embedded_blob_code_size();
+  CHECK_EQ(reinterpret_cast<uintptr_t>(
+               v8_arm_xlate::v8_Default_embedded_blob_code_),
+           reinterpret_cast<uintptr_t>(isolate_->embedded_blob_code()));
   static_assert(sizeof(FPSCR_rounding_mode_) == sizeof(int32_t));
   v8_arm_xlate::State state = {
       registers_,
@@ -6341,30 +6343,17 @@ void Simulator::ExecuteTranslated() {
       &overflow_vfp_flag_,
       &underflow_vfp_flag_,
       &inexact_vfp_flag_,
-      false};
+      &StepFromTranslated,
+      this,
+      xlate.functions.data(),
+      static_cast<uint32_t>(end_sim_pc),
+      0};
+  // returns at the end, or unwinding its native calls (too deep): goes on
   uint32_t pc = get_pc();
   while (pc != static_cast<uint32_t>(end_sim_pc)) {
-    uint32_t offset = pc - blob;
-    if (offset < blob_size) {
-      int b = Xlate::Find(offset);
-      if (b >= 0 && static_cast<uint32_t>(b) >= xlate.first &&
-          static_cast<uint32_t>(b) <= xlate.last) {
-        state.fallback = false;
-        xlate.calls++;
-        pc = v8_arm_xlate::v8_arm_xlate_builtins[b].function(&state, pc);
-        set_pc(pc);
-        if (!state.fallback) continue;
-      }
-    }
-    // the instruction at pc, simulated
-    if (xlate.stats) {
-      xlate.simulated++;
-      (*xlate.simulated_at)[pc]++;
-    }
-    icount_ = base::AddWithWraparound(icount_, 1);
-    InstructionDecode(reinterpret_cast<Instruction*>(pc));
-    pc = get_pc();
+    pc = v8_arm_xlate::v8_arm_xlate_next(&state, pc);
   }
+  set_pc(pc);
 }
 #endif  // V8_HOST_ARCH_WASM32
 
