@@ -1006,9 +1006,11 @@
       ],
     },  # v8_compiler_for_mksnapshot
     {
-      'target_name': 'v8_inspector_headers',
+      'target_name': 'v8_inspector_headers_gen',
       'type': 'none',
-      'toolsets': ['host', 'target'],
+      # (generated once, for both toolsets: their outputs are the same files,
+      # which ninja refuses from two toolsets' targets)
+      'toolsets': ['host'],
       'hard_dependency': 1,
       'includes': ['inspector.gypi'],
       'direct_dependent_settings': {
@@ -1056,6 +1058,19 @@
           'message': 'Generating inspector protocol sources from protocol json',
         },
       ],
+    },  # v8_inspector_headers_gen,
+    {
+      'target_name': 'v8_inspector_headers',
+      'type': 'none',
+      'toolsets': ['host', 'target'],
+      'hard_dependency': 1,
+      'includes': ['inspector.gypi'],
+      'direct_dependent_settings': {
+        'include_dirs': [
+          '<(inspector_generated_output_root)/include',
+        ],
+      },
+      'dependencies': [ 'v8_inspector_headers_gen#host' ],
     },  # v8_inspector_headers
     {
       'target_name': 'v8_base_without_compiler',

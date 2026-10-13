@@ -853,6 +853,11 @@ V8 shared library set USING_V8_SHARED.
 #else
 #error "Cannot detect Riscv's bitwidth"
 #endif
+#elif defined(__wasm32__)
+// linux-workers: V8 on wasm32 (as a guest of LKL), running an ARM target's
+// code in V8's ARM simulator (a 32-bit host, as ia32 is for it)
+#define V8_HOST_ARCH_WASM32 1
+#define V8_HOST_ARCH_32_BIT 1
 #else
 #error "Host architecture was not detected as supported by v8"
 #endif
@@ -939,8 +944,9 @@ V8 shared library set USING_V8_SHARED.
      !(V8_HOST_ARCH_X64 && V8_HOST_ARCH_32_BIT))
 #error Target architecture x32 is only supported on x64 host with x32 support
 #endif
-#if (V8_TARGET_ARCH_ARM && !(V8_HOST_ARCH_IA32 || V8_HOST_ARCH_ARM))
-#error Target architecture arm is only supported on arm and ia32 host
+#if (V8_TARGET_ARCH_ARM && \
+     !(V8_HOST_ARCH_IA32 || V8_HOST_ARCH_ARM || V8_HOST_ARCH_WASM32))
+#error Target architecture arm is only supported on arm, ia32 and wasm32 host
 #endif
 #if (V8_TARGET_ARCH_ARM64 && !(V8_HOST_ARCH_X64 || V8_HOST_ARCH_ARM64))
 #error Target architecture arm64 is only supported on arm64 and x64 host
