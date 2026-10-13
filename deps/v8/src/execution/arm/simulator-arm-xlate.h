@@ -30,9 +30,22 @@
 namespace v8_arm_xlate {
 
 struct State;
-// a translated builtin: runs from pc (an address in the blob) on, returns
-// the pc it leaves it at (to v8_arm_xlate_next)
-using Function = uint32_t (*)(State* s, uint32_t pc);
+
+// The translated builtins pass the core registers as arguments, from one
+// builtin to the next: wasm tail calls, the registers in wasm locals
+// throughout. (Just the interpreter's own, from one bytecode to the next,
+// with the rest in the state: slower, the state's stores costing more than
+// the arguments.) The flags stay in the state, each function loading and
+// saving them if it uses them. (tools/arm-to-c.py's PARAM_REGS: the same.)
+#define XL_PARAMS                                                            \
+  uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t r4,           \
+      uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9,       \
+      uint32_t r10, uint32_t r11, uint32_t r12, uint32_t r13, uint32_t r14
+#define XL_TAIL extern "C" __attribute__((target("tail-call")))
+
+// a translated builtin: runs from pc (an address in the blob) on, and goes
+// on (tail-calls v8_arm_xlate_next) from where it leaves it
+using Function = uint32_t (*)(State* s, uint32_t pc, XL_PARAMS);
 
 // The simulator's machine state, by pointers into its fields, and the
 // translated code's own.
@@ -45,20 +58,21 @@ struct State {
   int32_t* rounding_mode;  // FPSCR's RMode (bits 23:22, in place)
   bool *inv_op, *div_zero, *overflow, *underflow, *inexact;
 
-  // simulates the instruction at pc (the machine state saved), returns the
-  // next pc
-  uint32_t (*step)(State* s, uint32_t pc);
-  void* simulator;
   // each builtin's function, by index (null: simulate it)
   const Function* functions;
-  // Calls (bl, blx) are native calls, as deep as kMaxDepth: ret is the
-  // return address the innermost one waits for, where execution returns to
-  // it. Its frames hold nothing but where to resume (the machine state is
-  // saved across a call), so a native caller may also resume at its
-  // return address from elsewhere, and an unwinding (a mismatch, too deep)
-  // just returns to the simulator's loop, which goes on from the pc.
+  // Calls (bl, blx) are native calls, as deep as kMaxDepth (deeper: jumps):
+  // ret is the return address the innermost one waits for, where execution
+  // returns to it. Its frames hold nothing but where to resume (the machine
+  // state is saved across a call), so a native caller may also resume at
+  // its return address from elsewhere.
   uint32_t ret;
   uint32_t depth;
+  // set when execution needs the simulator (an instruction outside the blob,
+  // as calls into C++ are, or untranslated): the translated code returns,
+  // all of it, to the simulator's loop, which simulates the instruction.
+  // So no translated frame is ever under a call into C++, nor under a fork
+  // (Asyncify leaves them out: see the flake's wasm-ld-v8).
+  bool unwind;
 };
 constexpr uint32_t kMaxDepth = 96;
 
@@ -85,13 +99,15 @@ inline bool in_group(uint32_t offset, uint32_t group) {
          v8_arm_xlate_group[v8_arm_xlate_index[offset >> 5]] == group;
 }
 
-// Runs from pc on: each builtin's function, as far as it goes, then the
-// next one's, simulating what's outside the blob (calls into C++, through
-// the simulator's redirection) or untranslated; returns at the innermost
-// native call's return address (s->ret), or the simulator's end. (Not tail
-// calls between the functions: Asyncify, how a process forks here, has no
-// tail calls.)
-extern "C" uint32_t v8_arm_xlate_next(State* s, uint32_t pc);
+// Goes on from pc: tail-calls the function of the builtin there; or saves
+// the registers to the state and returns, at the innermost native call's
+// return address (s->ret), the simulator's end, or for the simulator
+// (s->unwind).
+XL_TAIL uint32_t v8_arm_xlate_next(State* s, uint32_t pc, XL_PARAMS);
+// for the simulator: saves the registers, sets s->unwind, returns pc
+XL_TAIL uint32_t v8_arm_xlate_unwind(State* s, uint32_t pc, XL_PARAMS);
+// runs from pc on, the registers in the state, as v8_arm_xlate_next
+extern "C" uint32_t v8_arm_xlate_enter(State* s, uint32_t pc);
 
 // --- the translated code's runtime -----------------------------------------
 

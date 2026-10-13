@@ -6301,10 +6301,6 @@ struct Xlate {
   }
 };
 
-uint32_t StepFromTranslated(v8_arm_xlate::State* s, uint32_t pc) {
-  return static_cast<Simulator*>(s->simulator)->XlateStep(pc);
-}
-
 }  // namespace
 
 uint32_t Simulator::XlateStep(uint32_t pc) {
@@ -6343,16 +6339,20 @@ void Simulator::ExecuteTranslated() {
       &overflow_vfp_flag_,
       &underflow_vfp_flag_,
       &inexact_vfp_flag_,
-      &StepFromTranslated,
-      this,
       xlate.functions.data(),
       static_cast<uint32_t>(end_sim_pc),
-      0};
-  // returns at the end, or unwinding its native calls (too deep): goes on
+      0,
+      false};
+  // The translated code runs until it needs the simulator (state.unwind:
+  // calls into C++ among them, here, under no translated frame), or the end.
   uint32_t pc = get_pc();
-  while (pc != static_cast<uint32_t>(end_sim_pc)) {
-    pc = v8_arm_xlate::v8_arm_xlate_next(&state, pc);
+  for (;;) {
+    state.unwind = false;
+    pc = v8_arm_xlate::v8_arm_xlate_enter(&state, pc);
+    if (!state.unwind) break;  // the end
+    pc = XlateStep(pc);
   }
+  DCHECK_EQ(pc, static_cast<uint32_t>(end_sim_pc));
   set_pc(pc);
 }
 #endif  // V8_HOST_ARCH_WASM32
