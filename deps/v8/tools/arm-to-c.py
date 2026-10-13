@@ -101,6 +101,28 @@ class Group:
       b.group = self
       self.labels.add(b.start)
       self.entries.add(b.start)
+    # a group's entries by number (v8_arm_xlate_entry): one group only
+    self.dense = len(members) > 1
+    self.entry_ids = {}
+    # the bytecode handlers' starts, where only the interpreter's registers
+    # are live (V8's InterpreterDispatchDescriptor: the accumulator r0, the
+    # bytecode offset r5 and array r6, the dispatch table r8; and the roots
+    # r10, fp, sp; the context r7 and lr, besides, to be safe): the others,
+    # and the flags, get poison there, so that nothing carries them from
+    # one handler to the next (a switch every value reaches is a switch
+    # every value is spilled across). A handler that read one would read
+    # poison.
+    self.handler_starts = {b.start for b in members
+                           if self.dense and b.name.endswith("Handler")}
+    self.kill = ("  r1 = 0xdead0001u; r2 = 0xdead0002u; r3 = 0xdead0003u; "
+                 "r4 = 0xdead0004u; r9 = 0xdead0009u; r12 = 0xdead000cu; "
+                 "N = Z = C = V = 0;\n")
+
+  def number_entries(self):
+    # the handlers' starts first: 1..len(handler_starts)
+    order = (sorted(self.handler_starts) +
+             sorted(self.entries - self.handler_starts))
+    self.entry_ids = {e: k + 1 for k, e in enumerate(order)}
 
   def contains(self, off):
     return any(b.start <= off < b.end for b in self.members)
@@ -150,9 +172,24 @@ class Group:
       w("  uint32_t %s;\n" % ", ".join(flags))
     w(load)
     w("  uint32_t npc, ct, cr;\n")
-    w("top:\n  switch (pc - B) {\n")
-    for e in sorted(self.entries):
-      w("    case 0x%x: goto L%x;\n" % (e, e))
+    # the entry switch: on the pc; in a group, on a dense entry number (a
+    # switch on pcs spread over the blob is a binary search, not a table)
+    if self.dense:
+      w("  uint32_t eid;\n")
+      w("top:\n  eid = v8_arm_xlate_entry[(pc - B) >> 2];\n")
+      # a jump to a bytecode handler's start: a switch of its own, which
+      # only the registers live there reach
+      w("  goto dispatch;\nhdispatch:\n  switch (eid) {\n")
+      for e in sorted(self.handler_starts):
+        w("    case %d: goto L%x;\n" % (self.entry_ids[e], e))
+      w("    default: __builtin_unreachable();\n  }\n")
+      w("dispatch:\n  switch (eid) {\n")
+      for e in sorted(self.entries):
+        w("    case %d: goto L%x;\n" % (self.entry_ids[e], e))
+    else:
+      w("top:\n  switch (pc - B) {\n")
+      for e in sorted(self.entries):
+        w("    case 0x%x: goto L%x;\n" % (e, e))
     w("    default: npc = pc; goto fb;\n  }\n")
     for a, word, body in ops:
       if word is None:
@@ -160,6 +197,8 @@ class Group:
         continue
       if a in self.labels:
         w("L%x:\n" % a)
+      if a in self.handler_starts:
+        w(self.kill)
       if body is None:
         w("  npc = B + 0x%x; goto fb;  // %08x\n" % (a, word))
       else:
@@ -169,10 +208,19 @@ class Group:
       b = self.members[0]
       inside = "npc - B - 0x%x < 0x%x" % (b.start, b.end - b.start)
       inside_ct = "false"
+    else:  # at an entry of the group: one load
+      inside = ("npc - B < v8_arm_xlate_blob_size && "
+                "v8_arm_xlate_entry[(npc - B) >> 2]")
+      inside_ct = ("ct - B < v8_arm_xlate_blob_size && "
+                   "v8_arm_xlate_entry[(ct - B) >> 2]")
+    if self.dense:
+      w("jmp:\n  if (npc - B < v8_arm_xlate_blob_size && npc != s->ret) {\n"
+        "    eid = v8_arm_xlate_entry[(npc - B) >> 2];\n"
+        "    if (eid - 1 < %d) { pc = npc; goto hdispatch; }\n"
+        "    if (eid) { pc = npc; goto dispatch; }\n  }\n" %
+        len(self.handler_starts))
     else:
-      inside = "in_group(npc - B, %d)" % self.index
-      inside_ct = "in_group(ct - B, %d)" % self.index
-    w("jmp:\n  if (%s && npc != s->ret) { pc = npc; goto top; }\n" % inside)
+      w("jmp:\n  if (%s && npc != s->ret) { pc = npc; goto top; }\n" % inside)
     # leaving: the next builtin, tail-called (v8_arm_xlate_next's lookup,
     # inline; it does the rest)
     w("out:\n" + save + "  if (npc != s->ret) {\n"
@@ -882,20 +930,32 @@ def main():
             '#pragma clang diagnostic ignored "-Wunused-but-set-variable"\n'
             '#pragma clang diagnostic ignored "-Wsometimes-uninitialized"\n'
             'namespace v8_arm_xlate {\n')
-  # each builtin alone (as one function, the bytecode handlers ran twice
-  # as slow: too big a function, for clang and for the wasm engine both)
-  groups = [Group(k, [b]) for k, b in enumerate(builtins)]
-  # shards of about equal size
-  per = (len(code) + shards - 1) // shards
-  files = [[] for _ in range(shards)]
+  # the interpreter as one function: the bytecode handlers (but the rarely
+  # run wide ones) and its entry, their dispatch a switch; each other
+  # builtin alone
+  def interpreter(b):
+    return ((b.name.endswith("Handler") and "Wide" not in b.name) or
+            b.name == "InterpreterEntryTrampoline")
+  groups = [Group(0, [b for b in builtins if interpreter(b)])]
+  for b in builtins:
+    if b.group is None:
+      groups.append(Group(len(groups), [b]))
   for g in groups:
-    files[min(g.members[0].start // per, shards - 1)].append(g)
+    for b in g.members:
+      b.scan()
+  dense = groups[0]
+  dense.number_entries()
+  assert len(dense.entry_ids) < 65536
+  # shards of about equal size (the interpreter's alone)
+  per = (len(code) + shards - 2) // (shards - 1)
+  files = [[] for _ in range(shards)]
+  files[0].append(dense)
+  for g in groups[1:]:
+    files[1 + min(g.members[0].start // per, shards - 2)].append(g)
   for k, gs in enumerate(files):
     with open("%s-%d.cc" % (prefix, k), "w") as f:
       f.write(header)
       for g in gs:
-        for b in g.members:
-          b.scan()
         f.write(g.emit())
       f.write("}  // namespace v8_arm_xlate\n")
   with open("%s-table.cc" % prefix, "w") as f:
@@ -923,6 +983,13 @@ def main():
     f.write('extern "C" const uint16_t v8_arm_xlate_index[] = {\n')
     for k in range(0, len(index), 16):
       f.write("  %s,\n" % ", ".join(str(x) for x in index[k:k + 16]))
+    f.write("};\n")
+    entry = [0] * (len(code) // 4)
+    for e, k in dense.entry_ids.items():
+      entry[e // 4] = k
+    f.write('extern "C" const uint16_t v8_arm_xlate_entry[] = {\n')
+    for k in range(0, len(entry), 32):
+      f.write("%s,\n" % ",".join(str(x) for x in entry[k:k + 32]))
     f.write("};\n")
     f.write(NEXT)
     f.write("}  // namespace v8_arm_xlate\n")

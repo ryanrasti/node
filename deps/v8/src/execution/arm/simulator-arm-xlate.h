@@ -93,6 +93,10 @@ extern "C" const uint32_t v8_arm_xlate_blob_size;
 // each builtin's group: the builtins translated as one function
 extern "C" const uint16_t v8_arm_xlate_group[];
 
+// for each instruction of the blob, its entry number in the one group that
+// has them (the interpreter's), or 0
+extern "C" const uint16_t v8_arm_xlate_entry[];
+
 // whether an offset in the blob is in a group's builtins
 inline bool in_group(uint32_t offset, uint32_t group) {
   return offset < v8_arm_xlate_blob_size &&
