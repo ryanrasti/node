@@ -169,9 +169,8 @@ class Builtin:
 
   # --- the second pass: C++ -----------------------------------------------
 
-  def emit(self):
-    out = []
-    w = out.append
+  def translated(self):
+    """[(address, word, C++ or None for the simulator)], VFP as locals."""
     ops = []
     # the VFP registers: the function's own copy (VF), as the core registers'
     vfp = (("s->vfp[", "VF["), ("getd(s, ", "getdv(VF, "), ("setd(s, ", "setdv(VF, "),
@@ -184,98 +183,7 @@ class Builtin:
       except Unsupported:
         body = None
       ops.append((a, self.word(a), body))
-    # the flags it uses (the registers are its arguments). The flags are
-    # dead where a builtin is entered, by ARM's ABI (a call or a jump into
-    # other code doesn't keep them, and V8's code doesn't rely on it), but
-    # for the instructions the simulator runs: they're the simulator's
-    # between them (saved before one, loaded at the entry after it). So
-    # leaving, and native calls, keep them in locals only, and clang drops
-    # the flag computations nothing reads.
-    text = "".join(body for _, _, body in ops if body)
-    flags = [f for f in "NZCV" if re.search(r"\b%s\b" % f, text)]
-    wflags = [f for f in "NZCV" if re.search(r"\b%s = " % f, text)]
-    line = lambda ss: "  %s\n" % " ".join(ss) if ss else ""
-    load = " ".join("%s = *P%s;" % (f, f) for f in flags)
-    save = line(["*P%s = %s;" % (f, f) for f in wflags])
-    # the registers: the arguments (PARAMS), the others from the state if it
-    # uses them (a register it writes, too: on a path that doesn't, the
-    # store gives back what it loaded), and to the state if it writes them
-    used = sorted({int(n) for n in re.findall(r"\br(\d+)\b", text)} - set(PARAMS))
-    written = sorted({int(n) for n in re.findall(r"\br(\d+) = ", text)} - set(PARAMS))
-    # the VFP words it uses and writes (a double register: two)
-    vused, vwritten = set(), set()
-    for m in re.finditer(r"\bVF\[(\d+)\]( = )?", text):
-      vused.add(int(m.group(1)))
-      if m.group(2):
-        vwritten.add(int(m.group(1)))
-    for op, size, n in re.findall(r"\b(get|set)(dv|fv)\(VF, (\d+)", text):
-      n = int(n)
-      words = [2 * n, 2 * n + 1] if size == "dv" else [n]
-      vused.update(words)
-      if op == "set":
-        vwritten.update(words)
-    vused, vwritten = sorted(vused), sorted(vwritten)
-    store = line(["R[%d] = (int32_t)r%d;" % (n, n) for n in written] +
-                 ["s->vfp[%d] = VF[%d];" % (k, k) for k in vwritten])
-    # after a native call: the registers from the state, where the callee
-    # left them (v8_arm_xlate_next saved the arguments)
-    reload = "  " + " ".join(["r%d = (uint32_t)R[%d];" % (n, n)
-                              for n in sorted(set(PARAMS) | set(used))] +
-                             ["VF[%d] = s->vfp[%d];" % (k, k) for k in vused]) + "\n"
-    w("// %s\n" % self.name)
-    w("XL_TAIL uint32_t xb_%d(State* s, XL_PARAMS) {\n" % self.index)
-    w("  const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;\n")
-    # (the state's pointers in locals: V8 compiles without strict aliasing,
-    # so through s they'd be reloaded after every store)
-    w("  int32_t* const R = s->r;\n"
-      "  bool *const PN = s->n, *const PZ = s->z, *const PC = s->c, "
-      "*const PV = s->v;\n")
-    if used:
-      w("  uint32_t %s;\n" % ", ".join("r%d = (uint32_t)R[%d]" % (n, n) for n in used))
-    if vused:
-      w("  uint32_t VF[64]; " + " ".join("VF[%d] = s->vfp[%d];" % (k, k) for k in vused) + "\n")
-    if flags:
-      w("  uint32_t %s;\n" % ", ".join("%s = 0" % f for f in flags))
-    w("  uint32_t pc = s->pc, npc, ct, cr;\n")
-    w("top:\n  switch (pc - B) {\n")
-    for e in sorted(self.entries):
-      if e in self.resumes and load:
-        w("    case 0x%x: %s goto L%x;\n" % (e, load, e))
-      else:
-        w("    case 0x%x: goto L%x;\n" % (e, e))
-    # (not an entry: for the simulator, its flags as they are)
-    w("    default: npc = pc; goto fb_entry;\n  }\n")
-    for a, word, body in ops:
-      if a in self.labels:
-        w("L%x:\n" % a)
-      if body is None:
-        w("  npc = B + 0x%x; goto fb;  // %08x\n" % (a, word))
-      else:
-        w(body)
-    w("  npc = B + 0x%x; goto jmp;\n" % self.end)  # falling off its end
-    # a computed jump: back to the entry switch if it stays here
-    w("jmp:\n  if (npc - B - 0x%x < 0x%x && npc != s->ret) { pc = npc; goto top; }\n"
-      % (self.start, self.end - self.start))
-    # leaving: the next builtin, tail-called (v8_arm_xlate_next's lookup,
-    # inline; it does the rest)
-    # (every call a jump: s->ret, the simulator's end, is outside the blob)
-    w("out:\n" + store + "  if (npc - B < 0x%xu) {\n"
-      "    s->pc = npc; [[clang::musttail]] return s->slots[(npc - B) >> 5](s, %s);\n"
-      "  }\n" % (len(self.code), ARGS))
-    w("  s->pc = npc; [[clang::musttail]] return v8_arm_xlate_next(s, %s);\n" % ARGS)
-    # an instruction for the simulator
-    w("fb:\n" + save + store + "fb_entry:\n"
-      "  s->pc = npc; [[clang::musttail]] return v8_arm_xlate_unwind(s, %s);\n" % ARGS)
-    # a call (bl, blx; r14 set): native, unless too deep (then a jump: the
-    # callee returns through the dispatch)
-    # (experiment: every call a jump; the callee returns through the dispatch)
-    w("call:\n  npc = ct; goto out;\n" + store +
-      "  {\n    uint32_t outer = s->ret;\n    s->ret = cr; s->depth++;\n"
-      "    s->pc = ct; uint32_t r = v8_arm_xlate_next(s, %s);\n"
-      "    s->ret = outer; s->depth--;\n"
-      "    if (r != cr || s->unwind) return r;\n  }\n" % ARGS)
-    w(reload + "  npc = cr; goto jmp;\n}\n\n")
-    return "".join(out)
+    return ops
 
   # Translates one instruction, as the simulator decodes it: C++ statements,
   # or Unsupported. dry: just whether it's supported.
@@ -848,6 +756,107 @@ class Builtin:
     raise Unsupported
 
 
+def emit_function(name, members, blob_size):
+  """One wasm function: a builtin, or a group of them (GROUPS), which go
+  from one to another by jumps, the registers in locals throughout."""
+  out = []
+  w = out.append
+  parts = [(b, b.translated()) for b in members]
+  # the flags it uses. The flags are dead where a builtin is entered, by
+  # ARM's ABI (a call or a jump into other code doesn't keep them, and V8's
+  # code doesn't rely on it), but for the instructions the simulator runs:
+  # they're the simulator's between them (saved before one, loaded at the
+  # entry after it). So leaving keeps them in locals only, and clang drops
+  # the flag computations nothing reads.
+  text = "".join(body for _, ops in parts for _, _, body in ops if body)
+  flags = [f for f in "NZCV" if re.search(r"\b%s\b" % f, text)]
+  wflags = [f for f in "NZCV" if re.search(r"\b%s = " % f, text)]
+  line = lambda ss: "  %s\n" % " ".join(ss) if ss else ""
+  load = " ".join("%s = *P%s;" % (f, f) for f in flags)
+  save = line(["*P%s = %s;" % (f, f) for f in wflags])
+  # the registers: the arguments (PARAMS), the others from the state if it
+  # uses them (a register it writes, too: on a path that doesn't, the store
+  # gives back what it loaded), and to the state if it writes them
+  used = sorted({int(n) for n in re.findall(r"\br(\d+)\b", text)} - set(PARAMS))
+  written = sorted({int(n) for n in re.findall(r"\br(\d+) = ", text)} - set(PARAMS))
+  # the VFP words it uses and writes (a double register: two)
+  vused, vwritten = set(), set()
+  for m in re.finditer(r"\bVF\[(\d+)\]( = )?", text):
+    vused.add(int(m.group(1)))
+    if m.group(2):
+      vwritten.add(int(m.group(1)))
+  for op, size, n in re.findall(r"\b(get|set)(dv|fv)\(VF, (\d+)", text):
+    n = int(n)
+    words = [2 * n, 2 * n + 1] if size == "dv" else [n]
+    vused.update(words)
+    if op == "set":
+      vwritten.update(words)
+  vused, vwritten = sorted(vused), sorted(vwritten)
+  store = line(["R[%d] = (int32_t)r%d;" % (n, n) for n in written] +
+               ["s->vfp[%d] = VF[%d];" % (k, k) for k in vwritten])
+  entries = sorted(e for b in members for e in b.entries)
+  resumes = {e for b in members for e in b.resumes}
+  w("// %s\n" % ", ".join(b.name for b in members))
+  w("XL_TAIL uint32_t %s(State* s, XL_PARAMS) {\n" % name)
+  w("  const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;\n")
+  # (the state's pointers in locals: V8 compiles without strict aliasing,
+  # so through s they'd be reloaded after every store)
+  w("  int32_t* const R = s->r;\n"
+    "  bool *const PN = s->n, *const PZ = s->z, *const PC = s->c, "
+    "*const PV = s->v;\n")
+  if used:
+    w("  uint32_t %s;\n" % ", ".join("r%d = (uint32_t)R[%d]" % (n, n) for n in used))
+  if vused:
+    w("  uint32_t VF[64]; " + " ".join("VF[%d] = s->vfp[%d];" % (k, k) for k in vused) + "\n")
+  if flags:
+    w("  uint32_t %s;\n" % ", ".join("%s = 0" % f for f in flags))
+  w("  uint32_t npc, ct, cr;\n")
+  w("  switch (s->pc - B) {\n")
+  for e in entries:
+    if e in resumes and load:
+      w("    case 0x%x: %s goto L%x;\n" % (e, load, e))
+    else:
+      w("    case 0x%x: goto L%x;\n" % (e, e))
+  # (not an entry: for the simulator, its flags as they are)
+  w("    default: npc = s->pc; goto fb_entry;\n  }\n")
+  for b, ops in parts:
+    for a, word, body in ops:
+      if a in b.labels:
+        w("L%x:\n" % a)
+      if body is None:
+        w("  npc = B + 0x%x; goto fb;  // %08x\n" % (a, word))
+      else:
+        w(body)
+    w("  npc = B + 0x%x; goto jmp;\n" % b.end)  # falling off its end
+  # a computed jump: to an entry here (of a builtin of the group), or out
+  w("jmp:\n  switch (npc - B) {\n")
+  for e in entries:
+    w("    case 0x%x: goto L%x;\n" % (e, e))
+  w("    default: goto out;\n  }\n")
+  # leaving: the next builtin's function, tail-called; outside the blob
+  # (the simulator's end, a call into C++), v8_arm_xlate_next
+  w("out:\n" + store + "  if (npc - B < 0x%xu) {\n"
+    "    s->pc = npc; [[clang::musttail]] return s->slots[(npc - B) >> 5](s, %s);\n"
+    "  }\n" % (blob_size, ARGS))
+  w("  s->pc = npc; [[clang::musttail]] return v8_arm_xlate_next(s, %s);\n" % ARGS)
+  # an instruction for the simulator
+  w("fb:\n" + save + store + "fb_entry:\n"
+    "  s->pc = npc; [[clang::musttail]] return v8_arm_xlate_unwind(s, %s);\n" % ARGS)
+  # a call (bl, blx; r14 set): a jump, the callee returning through the
+  # dispatch (no native calls: nothing live across one)
+  w("call:\n  (void)cr; npc = ct; goto jmp;\n}\n\n")
+  return "".join(out)
+
+
+# Builtins compiled as one function each group (bytecode handlers that run
+# one after another: from one to the next, a jump, not a tail call)
+GROUPS = [[n + "Handler" for n in (
+    "LdaSmi", "LdaZero", "Ldar", "Star", "ShortStar", "Mov", "Add", "Sub",
+    "AddSmi", "SubSmi", "Inc", "Dec", "BitwiseOrSmi", "TestLessThan",
+    "TestGreaterThan", "TestEqualStrict", "JumpIfFalse", "JumpIfTrue",
+    "JumpIfToBooleanFalse", "JumpLoop", "Jump", "Return", "LdaUndefined",
+    "LdaGlobal", "CallUndefinedReceiver1", "GetNamedProperty", "LdaConstant")]]
+
 # the registers the translated functions take as arguments (XL_PARAMS)
 PARAMS = [0, 5, 6, 8]
 ARGS = ", ".join("r%d" % n for n in PARAMS)
@@ -892,6 +901,16 @@ def main():
   for k, (name, start) in enumerate(named):
     end = named[k + 1][1] if k + 1 < len(named) else len(code)
     builtins.append(Builtin(k, name, start, end, code))
+  by_name = {b.name: b for b in builtins}
+  # each builtin's function: its own (xb_<index>), or its group's (xb_g<k>: Asyncify's remove-list, xb_*)
+  functions = {b.index: "xb_%d" % b.index for b in builtins}
+  groups = []
+  for k, names in enumerate(GROUPS):
+    members = [by_name[n] for n in names if n in by_name]
+    if members:
+      groups.append(("xb_g%d" % k, members))
+      for b in members:
+        functions[b.index] = "xb_g%d" % k
   header = ('// Autogenerated by tools/arm-to-c.py. Do not edit.\n'
             '#include "src/execution/arm/simulator-arm-xlate.h"\n'
             '#pragma clang diagnostic ignored "-Wunused-label"\n'
@@ -899,28 +918,33 @@ def main():
             '#pragma clang diagnostic ignored "-Wunused-but-set-variable"\n'
             '#pragma clang diagnostic ignored "-Wsometimes-uninitialized"\n'
             'namespace v8_arm_xlate {\n')
-  # each builtin a function of its own (the bytecode handlers as one ran
-  # twice as slow: too big a function, for clang and the wasm engine both)
-  # shards of about equal size
+  # each builtin a function of its own but the groups (all the bytecode
+  # handlers as one ran twice as slow: too big a function, for clang and the
+  # wasm engine both); shards of about equal size
   per = (len(code) + shards - 1) // shards
   files = [[] for _ in range(shards)]
+  grouped = {b.index for _, members in groups for b in members}
   for b in builtins:
-    files[min(b.start // per, shards - 1)].append(b)
-  for k, bs in enumerate(files):
+    if b.index not in grouped:
+      files[min(b.start // per, shards - 1)].append(("xb_%d" % b.index, [b]))
+  for name, members in groups:
+    files[min(members[0].start // per, shards - 1)].append((name, members))
+  for k, fs in enumerate(files):
     with open("%s-%d.cc" % (prefix, k), "w") as f:
       f.write(header)
-      for b in bs:
-        b.scan()
-        f.write(b.emit())
+      for name, members in fs:
+        for b in members:
+          b.scan()
+        f.write(emit_function(name, members, len(code)))
       f.write("}  // namespace v8_arm_xlate\n")
   with open("%s-table.cc" % prefix, "w") as f:
     f.write(header)
-    for b in builtins:
-      f.write("XL_TAIL uint32_t xb_%d(State*, XL_PARAMS);\n" % b.index)
+    for name in sorted(set(functions.values())):
+      f.write("XL_TAIL uint32_t %s(State*, XL_PARAMS);\n" % name)
     f.write('extern "C" const Builtin v8_arm_xlate_builtins[] = {\n')
     for b in builtins:
-      f.write('  {0x%x, 0x%x, xb_%d, "%s"},\n' % (b.start, b.end - b.start,
-                                                 b.index, b.name))
+      f.write('  {0x%x, 0x%x, %s, "%s"},\n' % (b.start, b.end - b.start,
+                                              functions[b.index], b.name))
     f.write("};\n")
     f.write('extern "C" const uint32_t v8_arm_xlate_builtin_count = %d;\n' %
             len(builtins))
