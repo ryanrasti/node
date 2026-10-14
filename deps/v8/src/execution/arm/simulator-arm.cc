@@ -6257,7 +6257,10 @@ namespace {
 // the translated builtins (simulator-arm-xlate.h): on unless V8_ARM_XLATE=0;
 // V8_ARM_XLATE_ONLY=<first>:<last> limits them to a range of builtins (in
 // blob order: to bisect); V8_ARM_XLATE_STATS=1 counts, at exit, the
-// instructions still simulated and where
+// instructions still simulated and where. V8_ARM_XLATE_PROFILE=<file>, with
+// V8_ARM_XLATE=0: each instruction of the blob simulated, counted, and at
+// exit appended to the file ("<offset> <count>" lines, offsets in hex): the
+// profile tools/arm-to-c.py lays out the translated code by
 struct Xlate {
   bool enabled = true;
   bool stats = false;
@@ -6266,6 +6269,9 @@ struct Xlate {
   // by 32 bytes of the blob: its builtin's function, or the way back here
   std::vector<v8_arm_xlate::Function> slots;
   uint64_t simulated = 0;
+  // V8_ARM_XLATE_PROFILE: executions by instruction (offset / 4)
+  std::vector<uint64_t>* profile = nullptr;
+  const char* profile_path = nullptr;
   std::unordered_map<uint32_t, uint64_t>* simulated_at = nullptr;
 
   Xlate() {
@@ -6280,8 +6286,14 @@ struct Xlate {
                               : nullptr);
     }
     for (uint32_t k = 0; k < v8_arm_xlate::v8_arm_xlate_blob_size / 32; k++) {
-      v8_arm_xlate::Function f = functions[v8_arm_xlate::v8_arm_xlate_index[k]];
-      slots.push_back(f ? f : v8_arm_xlate::v8_arm_xlate_unwind);
+      slots.push_back(functions[v8_arm_xlate::v8_arm_xlate_index[k]]
+                          ? v8_arm_xlate::v8_arm_xlate_slots[k]
+                          : v8_arm_xlate::v8_arm_xlate_unwind);
+    }
+    if (const char* e = getenv("V8_ARM_XLATE_PROFILE")) {
+      profile_path = e;
+      profile = new std::vector<uint64_t>(v8_arm_xlate::v8_arm_xlate_blob_size / 4);
+      atexit([] { Get().WriteProfile(); });
     }
     if (const char* e = getenv("V8_ARM_XLATE_STATS")) {
       stats = strcmp(e, "0") != 0;
@@ -6292,6 +6304,18 @@ struct Xlate {
   static Xlate& Get() {
     static Xlate* xlate = new Xlate();
     return *xlate;
+  }
+
+  void WriteProfile() {
+    FILE* f = fopen(profile_path, "a");
+    if (!f) return;
+    for (size_t k = 0; k < profile->size(); k++) {
+      if ((*profile)[k]) {
+        fprintf(f, "%zx %llu\n", k * 4,
+                static_cast<unsigned long long>((*profile)[k]));
+      }
+    }
+    fclose(f);
   }
 
   void Report() {
@@ -6386,6 +6410,21 @@ void Simulator::Execute() {
   // raw PC value and not the one used as input to arithmetic instructions.
   int program_counter = get_pc();
 
+#if V8_HOST_ARCH_WASM32
+  if (std::vector<uint64_t>* profile = Xlate::Get().profile) {
+    const uint32_t blob = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+        v8_arm_xlate::v8_Default_embedded_blob_code_));
+    while (program_counter != end_sim_pc) {
+      uint32_t offset = static_cast<uint32_t>(program_counter) - blob;
+      if (offset < v8_arm_xlate::v8_arm_xlate_blob_size) (*profile)[offset / 4]++;
+      Instruction* instr = reinterpret_cast<Instruction*>(program_counter);
+      icount_ = base::AddWithWraparound(icount_, 1);
+      InstructionDecode(instr);
+      program_counter = get_pc();
+    }
+    return;
+  }
+#endif
   if (v8_flags.stop_sim_at == 0) {
     // Fast version of the dispatch loop without checking whether the simulator
     // should be stopping at a particular executed instruction.

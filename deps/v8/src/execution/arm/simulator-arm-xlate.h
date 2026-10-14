@@ -96,6 +96,11 @@ struct Builtin {
 extern "C" const Builtin v8_arm_xlate_builtins[];
 extern "C" const uint32_t v8_arm_xlate_builtin_count;
 extern "C" const uint16_t v8_arm_xlate_index[];
+// for each 32 bytes of the blob, the function that runs it: its builtin's
+// own, or the group's (tools/arm-to-c.py: the builtins that run most, as
+// one function); and its builtin's own, where the group sends what it hasn't
+extern "C" const Function v8_arm_xlate_slots[];
+extern "C" const Function v8_arm_xlate_own[];
 extern "C" const unsigned char v8_Default_embedded_blob_code_[];
 extern "C" const uint32_t v8_arm_xlate_blob_size;
 // Goes on from s->pc: tail-calls the function of the builtin there; or saves

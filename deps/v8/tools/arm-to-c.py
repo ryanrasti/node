@@ -35,6 +35,7 @@ simulator, each address its code takes of itself (add rX, pc, #imm), and
 jump tables' branches.
 """
 
+import os
 import re
 import sys
 
@@ -107,6 +108,11 @@ class Builtin:
     # entries after an instruction the simulator ran: the only ones the
     # flags are live at (see emit)
     self.resumes = set()
+    # in a group: the instructions it has (those the profile saw run; all,
+    # without one), and the entries its fast path goes on at in its own
+    # function (cold_entries: the flags with them, through the state)
+    self.hot = None
+    self.cold_entries = set()
 
   def word(self, off):
     return int.from_bytes(self.code[off:off + 4], "little")
@@ -756,12 +762,38 @@ class Builtin:
     raise Unsupported
 
 
-def emit_function(name, members, blob_size):
-  """One wasm function: a builtin, or a group of them (GROUPS), which go
-  from one to another by jumps, the registers in locals throughout."""
+def emit_function(name, members, blob_size, own=None):
+  """One wasm function: a builtin, or a group of them, which go from one to
+  another by jumps, the registers in locals throughout. A group (own: each
+  builtin's own function, by index) has its members' hot instructions only
+  (b.hot); from there, to anything else, it goes on in the member's own
+  function, where that's an entry (b.cold_entries)."""
   out = []
   w = out.append
-  parts = [(b, b.translated()) for b in members]
+  parts = []
+  for b in members:
+    ops = b.translated()
+    if own is not None and b.hot is not None:
+      hot = b.hot
+      def leave(m, b=b, hot=hot):
+        target = int(m.group(1), 16)
+        if target in hot:
+          return m.group(0)
+        b.cold_entries.add(target)
+        return "{ npc = B + 0x%x; goto cold_%d; }" % (target, b.index)
+      kept = []
+      for k, (a, word, body) in enumerate(ops):
+        if a not in hot:
+          continue
+        body = body and re.sub(r"goto L([0-9a-f]+);", leave, body)
+        kept.append((a, word, body))
+        nxt = a + 4
+        if nxt < b.end and nxt not in hot:
+          # (falling through to an instruction not here)
+          b.cold_entries.add(nxt)
+          kept.append((None, None, "  npc = B + 0x%x; goto cold_%d;\n" % (nxt, b.index)))
+      ops = kept
+    parts.append((b, ops))
   # the flags it uses. The flags are dead where a builtin is entered, by
   # ARM's ABI (a call or a jump into other code doesn't keep them, and V8's
   # code doesn't rely on it), but for the instructions the simulator runs:
@@ -794,8 +826,13 @@ def emit_function(name, members, blob_size):
   vused, vwritten = sorted(vused), sorted(vwritten)
   store = line(["R[%d] = (int32_t)r%d;" % (n, n) for n in written] +
                ["s->vfp[%d] = VF[%d];" % (k, k) for k in vwritten])
-  entries = sorted(e for b in members for e in b.entries)
-  resumes = {e for b in members for e in b.resumes}
+  grouped = own is not None
+  entries = sorted(e for b in members for e in b.entries
+                   if not grouped or b.hot is None or e in b.hot)
+  resumes = {e for b in members for e in b.resumes} | \
+      ({e for b in members for e in b.cold_entries} if not grouped else set())
+  if grouped:
+    w("".join("XL_TAIL uint32_t %s(State*, XL_PARAMS);\n" % own[b.index] for b in members))
   w("// %s\n" % ", ".join(b.name for b in members))
   w("XL_TAIL uint32_t %s(State* s, XL_PARAMS) {\n" % name)
   w("  const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;\n")
@@ -817,11 +854,15 @@ def emit_function(name, members, blob_size):
       w("    case 0x%x: %s goto L%x;\n" % (e, load, e))
     else:
       w("    case 0x%x: goto L%x;\n" % (e, e))
-  # (not an entry: for the simulator, its flags as they are)
-  w("    default: npc = s->pc; goto fb_entry;\n  }\n")
+  if grouped:
+    # (not an entry here: the builtin's own function's)
+    w("    default: [[clang::musttail]] return v8_arm_xlate_own[(s->pc - B) >> 5](s, %s);\n  }\n" % ARGS)
+  else:
+    # (not an entry: for the simulator, its flags as they are)
+    w("    default: npc = s->pc; goto fb_entry;\n  }\n")
   for b, ops in parts:
     for a, word, body in ops:
-      if a in b.labels:
+      if a is not None and a in b.labels:
         w("L%x:\n" % a)
       if body is None:
         w("  npc = B + 0x%x; goto fb;  // %08x\n" % (a, word))
@@ -844,18 +885,60 @@ def emit_function(name, members, blob_size):
     "  s->pc = npc; [[clang::musttail]] return v8_arm_xlate_unwind(s, %s);\n" % ARGS)
   # a call (bl, blx; r14 set): a jump, the callee returning through the
   # dispatch (no native calls: nothing live across one)
-  w("call:\n  (void)cr; npc = ct; goto jmp;\n}\n\n")
+  w("call:\n  (void)cr; npc = ct; goto jmp;\n")
+  # a group's member, beyond its hot instructions: on in its own function
+  # (the flags, maybe live there, through the state)
+  for b in members if grouped else []:
+    w("cold_%d:\n" % b.index + save + store +
+      "  s->pc = npc; [[clang::musttail]] return %s(s, %s);\n" % (own[b.index], ARGS))
+  w("}\n\n")
   return "".join(out)
 
 
-# Builtins compiled as one function each group (bytecode handlers that run
-# one after another: from one to the next, a jump, not a tail call)
-GROUPS = [[n + "Handler" for n in (
-    "LdaSmi", "LdaZero", "Ldar", "Star", "ShortStar", "Mov", "Add", "Sub",
-    "AddSmi", "SubSmi", "Inc", "Dec", "BitwiseOrSmi", "TestLessThan",
-    "TestGreaterThan", "TestEqualStrict", "JumpIfFalse", "JumpIfTrue",
-    "JumpIfToBooleanFalse", "JumpLoop", "Jump", "Return", "LdaUndefined",
-    "LdaGlobal", "CallUndefinedReceiver1", "GetNamedProperty", "LdaConstant")]]
+# The profile (tools/arm-to-c.profile, from the simulator's counts:
+# V8_ARM_XLATE_PROFILE and --make-profile below): which builtins run most,
+# and which of their instructions. The most run go in one function (GROUP_BUDGET
+# instructions of theirs: all the bytecode handlers as one ran twice as slow,
+# too big a function for clang and the wasm engine), only the instructions
+# that ran. Lines: "<builtin> <size> <offset in it> <count>", size and offset
+# in hex. (Not among
+# the gyp action's inputs: after a new profile, touch this script.)
+PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arm-to-c.profile")
+GROUP_BUDGET = 3000
+
+
+def read_profile(builtins):
+  """{builtin index: {offset in the blob: count}}, for the builtins whose
+  size is still the profile's (else: changed, its counts no longer apply)."""
+  by_name = {b.name: b for b in builtins}
+  counts = {}
+  if not os.path.exists(PROFILE):
+    return counts
+  with open(PROFILE) as f:
+    for line in f:
+      name, size, off, n = line.split()
+      b = by_name.get(name)
+      if b and b.end - b.start == int(size, 16):
+        counts.setdefault(b.index, {})[b.start + int(off, 16)] = int(n)
+  return counts
+
+
+def make_profile(raw, embedded):
+  """The simulator's counts (raw: "<offset in the blob> <count>" lines,
+  maybe several runs'), by builtin: the profile, to stdout."""
+  code, named = parse_embedded(embedded)
+  total = {}
+  with open(raw) as f:
+    for line in f:
+      off, n = line.split()
+      total[int(off, 16)] = total.get(int(off, 16), 0) + int(n)
+  starts = [start for _, start in named] + [len(code)]
+  k = 0
+  for off in sorted(total):
+    while starts[k + 1] <= off:
+      k += 1
+    print("%s %x %x %d" % (named[k][0], starts[k + 1] - starts[k], off - starts[k], total[off]))
+
 
 # the registers the translated functions take as arguments (XL_PARAMS)
 PARAMS = [0, 5, 6, 8]
@@ -895,22 +978,30 @@ extern "C" uint32_t v8_arm_xlate_enter(State* s, uint32_t pc) {
 
 
 def main():
+  if sys.argv[1] == "--make-profile":
+    return make_profile(sys.argv[2], sys.argv[3])
   src, prefix, shards = sys.argv[1], sys.argv[2], int(sys.argv[3])
   code, named = parse_embedded(src)
   builtins = []
   for k, (name, start) in enumerate(named):
     end = named[k + 1][1] if k + 1 < len(named) else len(code)
     builtins.append(Builtin(k, name, start, end, code))
-  by_name = {b.name: b for b in builtins}
-  # each builtin's function: its own (xb_<index>), or its group's (xb_g<k>: Asyncify's remove-list, xb_*)
+  # the group: the builtins that ran most, their instructions that ran
+  counts = read_profile(builtins)
+  members, size = [], 0
+  for index in sorted(counts, key=lambda i: -sum(counts[i].values())):
+    b = builtins[index]
+    if size + len(counts[index]) > GROUP_BUDGET:
+      continue
+    b.hot = set(counts[index])
+    members.append(b)
+    size += len(counts[index])
+  members.sort(key=lambda b: b.start)
+  groups = [("xb_g0", members)] if members else []
+  # each builtin's function: its own (xb_<index>), or its group's
+  # (xb_g<k>: in Asyncify's remove-list, xb_*), for 32 bytes with an entry
+  # of its group's (the slots table)
   functions = {b.index: "xb_%d" % b.index for b in builtins}
-  groups = []
-  for k, names in enumerate(GROUPS):
-    members = [by_name[n] for n in names if n in by_name]
-    if members:
-      groups.append(("xb_g%d" % k, members))
-      for b in members:
-        functions[b.index] = "xb_g%d" % k
   header = ('// Autogenerated by tools/arm-to-c.py. Do not edit.\n'
             '#include "src/execution/arm/simulator-arm-xlate.h"\n'
             '#pragma clang diagnostic ignored "-Wunused-label"\n'
@@ -923,23 +1014,30 @@ def main():
   # wasm engine both); shards of about equal size
   per = (len(code) + shards - 1) // shards
   files = [[] for _ in range(shards)]
-  grouped = {b.index for _, members in groups for b in members}
+  # (the group first: its members' own functions get its cold entries)
   for b in builtins:
-    if b.index not in grouped:
-      files[min(b.start // per, shards - 1)].append(("xb_%d" % b.index, [b]))
-  for name, members in groups:
-    files[min(members[0].start // per, shards - 1)].append((name, members))
+    b.scan()
+  texts = {}
+  own = {b.index: "xb_%d" % b.index for b in builtins}
+  for name, ms in groups:
+    texts[name] = emit_function(name, ms, len(code), own=own)
+  for b in builtins:
+    b.entries |= b.cold_entries
+    b.labels |= b.cold_entries
+    texts["xb_%d" % b.index] = emit_function("xb_%d" % b.index, [b], len(code))
+  for b in builtins:
+    files[min(b.start // per, shards - 1)].append("xb_%d" % b.index)
+  for name, ms in groups:
+    files[min(ms[0].start // per, shards - 1)].append(name)
   for k, fs in enumerate(files):
     with open("%s-%d.cc" % (prefix, k), "w") as f:
       f.write(header)
-      for name, members in fs:
-        for b in members:
-          b.scan()
-        f.write(emit_function(name, members, len(code)))
+      for name in fs:
+        f.write(texts[name])
       f.write("}  // namespace v8_arm_xlate\n")
   with open("%s-table.cc" % prefix, "w") as f:
     f.write(header)
-    for name in sorted(set(functions.values())):
+    for name in sorted(set(own.values()) | {g for g, _ in groups}):
       f.write("XL_TAIL uint32_t %s(State*, XL_PARAMS);\n" % name)
     f.write('extern "C" const Builtin v8_arm_xlate_builtins[] = {\n')
     for b in builtins:
@@ -958,6 +1056,22 @@ def main():
     for k in range(0, len(index), 16):
       f.write("  %s,\n" % ", ".join(str(x) for x in index[k:k + 16]))
     f.write("};\n")
+    # for each 32 bytes of the blob: the function that runs it (slots: the
+    # group's, where it has an entry of one of its builtins; own: the
+    # builtin's own, where a group sends what it doesn't have)
+    group_entries = {e: g for g, ms in groups for b in ms for e in b.entries
+                     if b.hot is None or e in b.hot}
+    slots, owns = [], []
+    for b in builtins:
+      for a in range(b.start, b.end, 32):
+        g = next((group_entries[e] for e in range(a, a + 32, 4) if e in group_entries), None)
+        slots.append(g or own[b.index])
+        owns.append(own[b.index])
+    for table, fs in (("v8_arm_xlate_slots", slots), ("v8_arm_xlate_own", owns)):
+      f.write('extern "C" const Function %s[] = {\n' % table)
+      for k in range(0, len(fs), 8):
+        f.write("  %s,\n" % ", ".join(fs[k:k + 8]))
+      f.write("};\n")
     f.write(NEXT)
     f.write("}  // namespace v8_arm_xlate\n")
 
