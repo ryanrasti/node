@@ -904,7 +904,10 @@ def emit_function(name, members, blob_size, own=None):
 # in hex. (Not among
 # the gyp action's inputs: after a new profile, touch this script.)
 PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arm-to-c.profile")
-GROUP_BUDGET = 3000
+# the groups: the interpreter's (its bytecode handlers, its trampolines), and
+# the rest of what ran most; each up to its budget, in instructions that ran
+GROUPS = [(lambda b: b.name.endswith("Handler") or "Interpreter" in b.name, 1500),
+          (lambda b: True, 3000)]
 
 
 def read_profile(builtins):
@@ -986,18 +989,21 @@ def main():
   for k, (name, start) in enumerate(named):
     end = named[k + 1][1] if k + 1 < len(named) else len(code)
     builtins.append(Builtin(k, name, start, end, code))
-  # the group: the builtins that ran most, their instructions that ran
+  # the groups: the builtins that ran most, their instructions that ran
   counts = read_profile(builtins)
-  members, size = [], 0
-  for index in sorted(counts, key=lambda i: -sum(counts[i].values())):
-    b = builtins[index]
-    if size + len(counts[index]) > GROUP_BUDGET:
-      continue
-    b.hot = set(counts[index])
-    members.append(b)
-    size += len(counts[index])
-  members.sort(key=lambda b: b.start)
-  groups = [("xb_g0", members)] if members else []
+  groups = []
+  for k, (wanted, budget) in enumerate(GROUPS):
+    members, size = [], 0
+    for index in sorted(counts, key=lambda i: -sum(counts[i].values())):
+      b = builtins[index]
+      if b.hot is not None or not wanted(b) or size + len(counts[index]) > budget:
+        continue
+      b.hot = set(counts[index])
+      members.append(b)
+      size += len(counts[index])
+    if members:
+      members.sort(key=lambda b: b.start)
+      groups.append(("xb_g%d" % k, members))
   # each builtin's function: its own (xb_<index>), or its group's
   # (xb_g<k>: in Asyncify's remove-list, xb_*), for 32 bytes with an entry
   # of its group's (the slots table)
