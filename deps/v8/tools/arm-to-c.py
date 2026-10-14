@@ -17,9 +17,10 @@ The translation decodes each instruction as the simulator does
 the same order. Constant pools are decoded too, harmlessly: nothing branches
 to them.
 
-Each function takes the core registers as arguments (the flags stay in the
-state) and leaves by a wasm tail call to the function of the builtin it
-jumps to, the registers passed along. Inside, branches are gotos; a computed
+Each function takes the interpreter's registers as arguments (PARAMS; the
+others, in the state, it loads if it uses them and stores if it writes
+them), and leaves by a wasm tail call to the function of the builtin it
+jumps to, those registers passed along. Inside, branches are gotos; a computed
 jump (bx, ldr pc, ldm {pc}, mov pc) goes back to the entry switch if it
 stays in the function. A call (bl, blx) is a native call, which resumes at
 the return address when execution comes back to it. What the translation
@@ -103,6 +104,9 @@ class Builtin:
     self.code = code  # the whole blob
     self.labels = {start}  # offsets that need a label
     self.entries = {start}  # offsets the entry switch reaches
+    # entries after an instruction the simulator ran: the only ones the
+    # flags are live at (see emit)
+    self.resumes = set()
 
   def word(self, off):
     return int.from_bytes(self.code[off:off + 4], "little")
@@ -125,6 +129,8 @@ class Builtin:
         ok = False
       if not ok:
         self.entry(a + 4)
+        if self.inside(a + 4):
+          self.resumes.add(a + 4)
         continue
       if cond == 0xF:
         continue
@@ -167,39 +173,78 @@ class Builtin:
     out = []
     w = out.append
     ops = []
+    # the VFP registers: the function's own copy (VF), as the core registers'
+    vfp = (("s->vfp[", "VF["), ("getd(s, ", "getdv(VF, "), ("setd(s, ", "setdv(VF, "),
+           ("getf(s, ", "getfv(VF, "), ("setf(s, ", "setfv(VF, "))
     for a in range(self.start, self.end, 4):
       try:
         body = self.translate(a, self.word(a))
+        for old, new in vfp:
+          body = body.replace(old, new)
       except Unsupported:
         body = None
       ops.append((a, self.word(a), body))
-    # the flags it uses (the registers are its arguments)
+    # the flags it uses (the registers are its arguments). The flags are
+    # dead where a builtin is entered, by ARM's ABI (a call or a jump into
+    # other code doesn't keep them, and V8's code doesn't rely on it), but
+    # for the instructions the simulator runs: they're the simulator's
+    # between them (saved before one, loaded at the entry after it). So
+    # leaving, and native calls, keep them in locals only, and clang drops
+    # the flag computations nothing reads.
     text = "".join(body for _, _, body in ops if body)
     flags = [f for f in "NZCV" if re.search(r"\b%s\b" % f, text)]
     wflags = [f for f in "NZCV" if re.search(r"\b%s = " % f, text)]
     line = lambda ss: "  %s\n" % " ".join(ss) if ss else ""
-    load = line(["%s = *P%s;" % (f, f) for f in flags])
+    load = " ".join("%s = *P%s;" % (f, f) for f in flags)
     save = line(["*P%s = %s;" % (f, f) for f in wflags])
+    # the registers: the arguments (PARAMS), the others from the state if it
+    # uses them (a register it writes, too: on a path that doesn't, the
+    # store gives back what it loaded), and to the state if it writes them
+    used = sorted({int(n) for n in re.findall(r"\br(\d+)\b", text)} - set(PARAMS))
+    written = sorted({int(n) for n in re.findall(r"\br(\d+) = ", text)} - set(PARAMS))
+    # the VFP words it uses and writes (a double register: two)
+    vused, vwritten = set(), set()
+    for m in re.finditer(r"\bVF\[(\d+)\]( = )?", text):
+      vused.add(int(m.group(1)))
+      if m.group(2):
+        vwritten.add(int(m.group(1)))
+    for op, size, n in re.findall(r"\b(get|set)(dv|fv)\(VF, (\d+)", text):
+      n = int(n)
+      words = [2 * n, 2 * n + 1] if size == "dv" else [n]
+      vused.update(words)
+      if op == "set":
+        vwritten.update(words)
+    vused, vwritten = sorted(vused), sorted(vwritten)
+    store = line(["R[%d] = (int32_t)r%d;" % (n, n) for n in written] +
+                 ["s->vfp[%d] = VF[%d];" % (k, k) for k in vwritten])
     # after a native call: the registers from the state, where the callee
-    # left them (v8_arm_xlate_next saved them), and the flags
-    reload = ("  " + " ".join("r%d = (uint32_t)R[%d];" % (n, n) for n in range(15)) +
-              "\n" + load)
+    # left them (v8_arm_xlate_next saved the arguments)
+    reload = "  " + " ".join(["r%d = (uint32_t)R[%d];" % (n, n)
+                              for n in sorted(set(PARAMS) | set(used))] +
+                             ["VF[%d] = s->vfp[%d];" % (k, k) for k in vused]) + "\n"
     w("// %s\n" % self.name)
-    w("XL_TAIL uint32_t xb_%d(State* s, uint32_t pc, XL_PARAMS) {\n" % self.index)
+    w("XL_TAIL uint32_t xb_%d(State* s, XL_PARAMS) {\n" % self.index)
     w("  const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;\n")
     # (the state's pointers in locals: V8 compiles without strict aliasing,
     # so through s they'd be reloaded after every store)
     w("  int32_t* const R = s->r;\n"
       "  bool *const PN = s->n, *const PZ = s->z, *const PC = s->c, "
       "*const PV = s->v;\n")
+    if used:
+      w("  uint32_t %s;\n" % ", ".join("r%d = (uint32_t)R[%d]" % (n, n) for n in used))
+    if vused:
+      w("  uint32_t VF[64]; " + " ".join("VF[%d] = s->vfp[%d];" % (k, k) for k in vused) + "\n")
     if flags:
-      w("  uint32_t %s;\n" % ", ".join(flags))
-    w(load)
-    w("  uint32_t npc, ct, cr;\n")
+      w("  uint32_t %s;\n" % ", ".join("%s = 0" % f for f in flags))
+    w("  uint32_t pc = s->pc, npc, ct, cr;\n")
     w("top:\n  switch (pc - B) {\n")
     for e in sorted(self.entries):
-      w("    case 0x%x: goto L%x;\n" % (e, e))
-    w("    default: npc = pc; goto fb;\n  }\n")
+      if e in self.resumes and load:
+        w("    case 0x%x: %s goto L%x;\n" % (e, load, e))
+      else:
+        w("    case 0x%x: goto L%x;\n" % (e, e))
+    # (not an entry: for the simulator, its flags as they are)
+    w("    default: npc = pc; goto fb_entry;\n  }\n")
     for a, word, body in ops:
       if a in self.labels:
         w("L%x:\n" % a)
@@ -213,21 +258,20 @@ class Builtin:
       % (self.start, self.end - self.start))
     # leaving: the next builtin, tail-called (v8_arm_xlate_next's lookup,
     # inline; it does the rest)
-    w("out:\n" + save + "  if (npc != s->ret) {\n"
-      "    uint32_t offset = npc - B;\n"
-      "    if (offset < v8_arm_xlate_blob_size) {\n"
-      "      Function f = s->functions[v8_arm_xlate_index[offset >> 5]];\n"
-      "      if (f) [[clang::musttail]] return f(s, npc, %s);\n"
-      "    }\n  }\n" % ARGS)
-    w("  [[clang::musttail]] return v8_arm_xlate_next(s, npc, %s);\n" % ARGS)
+    # (every call a jump: s->ret, the simulator's end, is outside the blob)
+    w("out:\n" + store + "  if (npc - B < 0x%xu) {\n"
+      "    s->pc = npc; [[clang::musttail]] return s->slots[(npc - B) >> 5](s, %s);\n"
+      "  }\n" % (len(self.code), ARGS))
+    w("  s->pc = npc; [[clang::musttail]] return v8_arm_xlate_next(s, %s);\n" % ARGS)
     # an instruction for the simulator
-    w("fb:\n" + save +
-      "  [[clang::musttail]] return v8_arm_xlate_unwind(s, npc, %s);\n" % ARGS)
+    w("fb:\n" + save + store + "fb_entry:\n"
+      "  s->pc = npc; [[clang::musttail]] return v8_arm_xlate_unwind(s, %s);\n" % ARGS)
     # a call (bl, blx; r14 set): native, unless too deep (then a jump: the
     # callee returns through the dispatch)
-    w("call:\n  if (s->depth >= kMaxDepth) { npc = ct; goto out; }\n" + save +
+    # (experiment: every call a jump; the callee returns through the dispatch)
+    w("call:\n  npc = ct; goto out;\n" + store +
       "  {\n    uint32_t outer = s->ret;\n    s->ret = cr; s->depth++;\n"
-      "    uint32_t r = v8_arm_xlate_next(s, ct, %s);\n"
+      "    s->pc = ct; uint32_t r = v8_arm_xlate_next(s, %s);\n"
       "    s->ret = outer; s->depth--;\n"
       "    if (r != cr || s->unwind) return r;\n  }\n" % ARGS)
     w(reload + "  npc = cr; goto jmp;\n}\n\n")
@@ -804,22 +848,24 @@ class Builtin:
     raise Unsupported
 
 
-# the registers, as the translated functions' arguments (XL_PARAMS)
-ARGS = ", ".join("r%d" % n for n in range(15))
+# the registers the translated functions take as arguments (XL_PARAMS)
+PARAMS = [0, 5, 6, 8]
+ARGS = ", ".join("r%d" % n for n in PARAMS)
 
 NEXT = """
-XL_TAIL uint32_t v8_arm_xlate_unwind(State* s, uint32_t pc, XL_PARAMS) {
+XL_TAIL uint32_t v8_arm_xlate_unwind(State* s, XL_PARAMS) {
   s->unwind = true;
-  [[clang::musttail]] return v8_arm_xlate_next(s, pc, %(args)s);
+  [[clang::musttail]] return v8_arm_xlate_next(s, %(args)s);
 }
 
-XL_TAIL uint32_t v8_arm_xlate_next(State* s, uint32_t pc, XL_PARAMS) {
+XL_TAIL uint32_t v8_arm_xlate_next(State* s, XL_PARAMS) {
+  const uint32_t pc = s->pc;
   const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;
   if (pc != s->ret && !s->unwind) {
     uint32_t offset = pc - B;
     if (offset < v8_arm_xlate_blob_size) {
       Function f = s->functions[v8_arm_xlate_index[offset >> 5]];
-      if (f) [[clang::musttail]] return f(s, pc, %(args)s);
+      if (f) [[clang::musttail]] return f(s, %(args)s);
     }
     // outside the blob (the simulator's end, or a call into C++), or not
     // translated: for the simulator
@@ -831,11 +877,12 @@ XL_TAIL uint32_t v8_arm_xlate_next(State* s, uint32_t pc, XL_PARAMS) {
 
 extern "C" uint32_t v8_arm_xlate_enter(State* s, uint32_t pc) {
   int32_t* R = s->r;
-  return v8_arm_xlate_next(s, pc, %(load)s);
+  s->pc = pc;
+  return v8_arm_xlate_next(s, %(load)s);
 }
 """ % {"args": ARGS,
-       "save": "int32_t* R = s->r; " + " ".join("R[%d] = r%d;" % (n, n) for n in range(15)),
-       "load": ", ".join("(uint32_t)R[%d]" % n for n in range(15))}
+       "save": "int32_t* R = s->r; " + " ".join("R[%d] = r%d;" % (n, n) for n in PARAMS),
+       "load": ", ".join("(uint32_t)R[%d]" % n for n in PARAMS)}
 
 
 def main():
@@ -869,7 +916,7 @@ def main():
   with open("%s-table.cc" % prefix, "w") as f:
     f.write(header)
     for b in builtins:
-      f.write("XL_TAIL uint32_t xb_%d(State*, uint32_t, XL_PARAMS);\n" % b.index)
+      f.write("XL_TAIL uint32_t xb_%d(State*, XL_PARAMS);\n" % b.index)
     f.write('extern "C" const Builtin v8_arm_xlate_builtins[] = {\n')
     for b in builtins:
       f.write('  {0x%x, 0x%x, xb_%d, "%s"},\n' % (b.start, b.end - b.start,

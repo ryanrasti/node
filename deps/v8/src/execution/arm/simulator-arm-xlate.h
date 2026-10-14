@@ -33,21 +33,22 @@ namespace v8_arm_xlate {
 
 struct State;
 
-// The translated builtins pass the core registers as arguments, from one
-// builtin to the next: wasm tail calls, the registers in wasm locals
-// throughout. (Just the interpreter's own, from one bytecode to the next,
-// with the rest in the state: slower, the state's stores costing more than
-// the arguments.) The flags stay in the state, each function loading and
-// saving them if it uses them.
-#define XL_PARAMS                                                            \
-  uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t r4,           \
-      uint32_t r5, uint32_t r6, uint32_t r7, uint32_t r8, uint32_t r9,       \
-      uint32_t r10, uint32_t r11, uint32_t r12, uint32_t r13, uint32_t r14
+// The translated builtins pass four core registers as arguments, from one
+// builtin to the next (wasm tail calls): the interpreter's, which every
+// bytecode handler's dispatch reads (r0, the accumulator; r5, r6, the
+// bytecode offset and array; r8, the dispatch table). With the state, that's
+// as many as the host engine passes in registers (five, on x64: more go
+// through the stack, each way, at every dispatch: they cost 15 registers'
+// worth, most of a bytecode handler's time). The other registers are in the
+// state (s->r), each function loading those it uses and storing those it
+// writes; the flags are dead between builtins (tools/arm-to-c.py).
+#define XL_PARAMS uint32_t r0, uint32_t r5, uint32_t r6, uint32_t r8
 #define XL_TAIL extern "C" __attribute__((target("tail-call")))
 
-// a translated builtin: runs from pc (an address in the blob) on, and goes
-// on (tail-calls v8_arm_xlate_next) from where it leaves it
-using Function = uint32_t (*)(State* s, uint32_t pc, XL_PARAMS);
+// a translated builtin: runs from s->pc (an address in the blob) on, and
+// goes on (tail-calls the next one, or v8_arm_xlate_next) from where it
+// leaves it
+using Function = uint32_t (*)(State* s, XL_PARAMS);
 
 // The simulator's machine state, by pointers into its fields, and the
 // translated code's own.
@@ -75,6 +76,11 @@ struct State {
   // So no translated frame is ever under a call into C++, nor under a fork
   // (Asyncify leaves them out: see the flake's wasm-ld-v8).
   bool unwind;
+  // where a translated function is to run from (its argument, in effect)
+  uint32_t pc;
+  // the function for each 32 bytes of the blob (its builtin's; for one left
+  // to the simulator, v8_arm_xlate_unwind): where a builtin goes on
+  const Function* slots;
 };
 constexpr uint32_t kMaxDepth = 96;
 
@@ -92,13 +98,13 @@ extern "C" const uint32_t v8_arm_xlate_builtin_count;
 extern "C" const uint16_t v8_arm_xlate_index[];
 extern "C" const unsigned char v8_Default_embedded_blob_code_[];
 extern "C" const uint32_t v8_arm_xlate_blob_size;
-// Goes on from pc: tail-calls the function of the builtin there; or saves
-// the registers to the state and returns, at the innermost native call's
+// Goes on from s->pc: tail-calls the function of the builtin there; or saves
+// the argument registers to the state (the others are there) and returns, at the innermost native call's
 // return address (s->ret), the simulator's end, or for the simulator
 // (s->unwind).
-XL_TAIL uint32_t v8_arm_xlate_next(State* s, uint32_t pc, XL_PARAMS);
-// for the simulator: saves the registers, sets s->unwind, returns pc
-XL_TAIL uint32_t v8_arm_xlate_unwind(State* s, uint32_t pc, XL_PARAMS);
+XL_TAIL uint32_t v8_arm_xlate_next(State* s, XL_PARAMS);
+// for the simulator: saves the argument registers, sets s->unwind, returns pc
+XL_TAIL uint32_t v8_arm_xlate_unwind(State* s, XL_PARAMS);
 // runs from pc on, the registers in the state, as v8_arm_xlate_next
 extern "C" uint32_t v8_arm_xlate_enter(State* s, uint32_t pc);
 
@@ -230,6 +236,21 @@ XL_INLINE float getf(State* s, int n) {
   return x;
 }
 XL_INLINE void setf(State* s, int n, float x) { memcpy(&s->vfp[n], &x, 4); }
+// the same, on a function's own copy of the VFP registers (V: the words it
+// uses, loaded at its entry, written back at its exits; constant indices, so
+// clang keeps them in wasm locals)
+XL_INLINE double getdv(const uint32_t* V, int d) {
+  double x;
+  memcpy(&x, &V[2 * d], 8);
+  return x;
+}
+XL_INLINE void setdv(uint32_t* V, int d, double x) { memcpy(&V[2 * d], &x, 8); }
+XL_INLINE float getfv(const uint32_t* V, int n) {
+  float x;
+  memcpy(&x, &V[n], 4);
+  return x;
+}
+XL_INLINE void setfv(uint32_t* V, int n, float x) { memcpy(&V[n], &x, 4); }
 
 XL_INLINE double canon(State* s, double x) {
   if (*s->default_nan && std::isnan(x)) {

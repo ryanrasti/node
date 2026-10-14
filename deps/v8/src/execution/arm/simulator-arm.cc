@@ -6263,6 +6263,8 @@ struct Xlate {
   bool stats = false;
   // each builtin's function; null where V8_ARM_XLATE_ONLY leaves it out
   std::vector<v8_arm_xlate::Function> functions;
+  // by 32 bytes of the blob: its builtin's function, or the way back here
+  std::vector<v8_arm_xlate::Function> slots;
   uint64_t simulated = 0;
   std::unordered_map<uint32_t, uint64_t>* simulated_at = nullptr;
 
@@ -6276,6 +6278,10 @@ struct Xlate {
       functions.push_back(b >= first && b <= last
                               ? v8_arm_xlate::v8_arm_xlate_builtins[b].function
                               : nullptr);
+    }
+    for (uint32_t k = 0; k < v8_arm_xlate::v8_arm_xlate_blob_size / 32; k++) {
+      v8_arm_xlate::Function f = functions[v8_arm_xlate::v8_arm_xlate_index[k]];
+      slots.push_back(f ? f : v8_arm_xlate::v8_arm_xlate_unwind);
     }
     if (const char* e = getenv("V8_ARM_XLATE_STATS")) {
       stats = strcmp(e, "0") != 0;
@@ -6355,6 +6361,7 @@ void Simulator::ExecuteTranslated() {
       static_cast<uint32_t>(end_sim_pc),
       0,
       false};
+  state.slots = xlate.slots.data();
   // The translated code runs until it needs the simulator (state.unwind:
   // calls into C++ among them, here, under no translated frame), or the end.
   uint32_t pc = get_pc();
