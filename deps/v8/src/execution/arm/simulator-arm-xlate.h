@@ -10,7 +10,8 @@
 // function over the simulator's own machine state: the registers in wasm
 // locals while it runs, the stack and frames in memory, return addresses
 // still addresses in the blob. A builtin goes on to the next by a tail call,
-// and calls (bl, blx) are native calls. What the translation leaves out
+// and so do calls (bl, blx): the callee returns through the same dispatch,
+// so no translated code is under a native frame of its own. What the translation leaves out
 // (calls into C++, which go through the simulator's redirection, and
 // instructions it doesn't translate) returns all of the translated code to
 // the simulator's loop, which simulates the instruction and enters the
@@ -63,13 +64,6 @@ struct State {
 
   // each builtin's function, by index (null: simulate it)
   const Function* functions;
-  // Calls (bl, blx) are native calls, as deep as kMaxDepth (deeper: jumps):
-  // ret is the return address the innermost one waits for, where execution
-  // returns to it. Its frames hold nothing but where to resume (the machine
-  // state is saved across a call), so a native caller may also resume at
-  // its return address from elsewhere.
-  uint32_t ret;
-  uint32_t depth;
   // set when execution needs the simulator (an instruction outside the blob,
   // as calls into C++ are, or untranslated): the translated code returns,
   // all of it, to the simulator's loop, which simulates the instruction.
@@ -82,7 +76,6 @@ struct State {
   // to the simulator, v8_arm_xlate_unwind): where a builtin goes on
   const Function* slots;
 };
-constexpr uint32_t kMaxDepth = 96;
 
 struct Builtin {
   uint32_t start;  // offset in the blob
@@ -104,9 +97,8 @@ extern "C" const Function v8_arm_xlate_own[];
 extern "C" const unsigned char v8_Default_embedded_blob_code_[];
 extern "C" const uint32_t v8_arm_xlate_blob_size;
 // Goes on from s->pc: tail-calls the function of the builtin there; or saves
-// the argument registers to the state (the others are there) and returns, at the innermost native call's
-// return address (s->ret), the simulator's end, or for the simulator
-// (s->unwind).
+// the argument registers to the state (the others are there) and returns, at
+// the simulator's end, or for the simulator (s->unwind).
 XL_TAIL uint32_t v8_arm_xlate_next(State* s, XL_PARAMS);
 // for the simulator: saves the argument registers, sets s->unwind, returns pc
 XL_TAIL uint32_t v8_arm_xlate_unwind(State* s, XL_PARAMS);

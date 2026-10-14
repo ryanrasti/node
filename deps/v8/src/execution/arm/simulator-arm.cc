@@ -6256,7 +6256,8 @@ namespace {
 
 // the translated builtins (simulator-arm-xlate.h): on unless V8_ARM_XLATE=0;
 // V8_ARM_XLATE_ONLY=<first>:<last> limits them to a range of builtins (in
-// blob order: to bisect); V8_ARM_XLATE_STATS=1 counts, at exit, the
+// blob order: to bisect; each in its own function, without the groups, whose
+// members go from one to another directly); V8_ARM_XLATE_STATS=1 counts, at exit, the
 // instructions still simulated and where. V8_ARM_XLATE_PROFILE=<file>, with
 // V8_ARM_XLATE=0: each instruction of the blob simulated, counted, and at
 // exit appended to the file ("<offset> <count>" lines, offsets in hex): the
@@ -6277,18 +6278,18 @@ struct Xlate {
   Xlate() {
     if (const char* e = getenv("V8_ARM_XLATE")) enabled = strcmp(e, "0") != 0;
     uint32_t first = 0, last = UINT32_MAX;
-    if (const char* e = getenv("V8_ARM_XLATE_ONLY")) {
-      sscanf(e, "%u:%u", &first, &last);
-    }
+    const char* only = getenv("V8_ARM_XLATE_ONLY");
+    if (only) sscanf(only, "%u:%u", &first, &last);
     for (uint32_t b = 0; b < v8_arm_xlate::v8_arm_xlate_builtin_count; b++) {
       functions.push_back(b >= first && b <= last
                               ? v8_arm_xlate::v8_arm_xlate_builtins[b].function
                               : nullptr);
     }
     for (uint32_t k = 0; k < v8_arm_xlate::v8_arm_xlate_blob_size / 32; k++) {
-      slots.push_back(functions[v8_arm_xlate::v8_arm_xlate_index[k]]
-                          ? v8_arm_xlate::v8_arm_xlate_slots[k]
-                          : v8_arm_xlate::v8_arm_xlate_unwind);
+      slots.push_back(!functions[v8_arm_xlate::v8_arm_xlate_index[k]]
+                          ? v8_arm_xlate::v8_arm_xlate_unwind
+                      : only ? v8_arm_xlate::v8_arm_xlate_own[k]
+                             : v8_arm_xlate::v8_arm_xlate_slots[k]);
     }
     if (const char* e = getenv("V8_ARM_XLATE_PROFILE")) {
       profile_path = e;
@@ -6382,10 +6383,9 @@ void Simulator::ExecuteTranslated() {
       &underflow_vfp_flag_,
       &inexact_vfp_flag_,
       xlate.functions.data(),
-      static_cast<uint32_t>(end_sim_pc),
+      false,
       0,
-      false};
-  state.slots = xlate.slots.data();
+      xlate.slots.data()};
   // The translated code runs until it needs the simulator (state.unwind:
   // calls into C++ among them, here, under no translated frame), or the end.
   uint32_t pc = get_pc();

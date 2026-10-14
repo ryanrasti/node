@@ -22,8 +22,8 @@ others, in the state, it loads if it uses them and stores if it writes
 them), and leaves by a wasm tail call to the function of the builtin it
 jumps to, those registers passed along. Inside, branches are gotos; a computed
 jump (bx, ldr pc, ldm {pc}, mov pc) goes back to the entry switch if it
-stays in the function. A call (bl, blx) is a native call, which resumes at
-the return address when execution comes back to it. What the translation
+stays in the function. A call (bl, blx) is a jump too, the callee returning
+to the return address (an entry) through the same dispatch. What the translation
 leaves out (calls into C++, which go through the simulator's redirection:
 svc; exclusive loads and stores; NEON; what the simulator itself doesn't
 implement) returns all of it to the simulator's loop, which simulates that
@@ -901,8 +901,7 @@ def emit_function(name, members, blob_size, own=None):
 # instructions of theirs: all the bytecode handlers as one ran twice as slow,
 # too big a function for clang and the wasm engine), only the instructions
 # that ran. Lines: "<builtin> <size> <offset in it> <count>", size and offset
-# in hex. (Not among
-# the gyp action's inputs: after a new profile, touch this script.)
+# in hex.
 PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arm-to-c.profile")
 # the groups: the interpreter's (its bytecode handlers, its trampolines), and
 # the rest of what ran most; each up to its budget, in instructions that ran
@@ -916,13 +915,23 @@ def read_profile(builtins):
   by_name = {b.name: b for b in builtins}
   counts = {}
   if not os.path.exists(PROFILE):
+    sys.stderr.write("arm-to-c.py: no %s: no groups\n" % PROFILE)
     return counts
+  stale = set()
   with open(PROFILE) as f:
     for line in f:
       name, size, off, n = line.split()
       b = by_name.get(name)
       if b and b.end - b.start == int(size, 16):
         counts.setdefault(b.index, {})[b.start + int(off, 16)] = int(n)
+      else:
+        stale.add(name)
+  # (the groups shrink, silently slower: a new profile is due)
+  if stale:
+    sys.stderr.write("arm-to-c.py: the profile's counts for %d of %d builtins "
+                     "no longer apply (changed or gone): %s\n"
+                     % (len(stale), len(stale) + len(counts),
+                        " ".join(sorted(stale)[:10]) + (" ..." if len(stale) > 10 else "")))
   return counts
 
 
@@ -956,7 +965,7 @@ XL_TAIL uint32_t v8_arm_xlate_unwind(State* s, XL_PARAMS) {
 XL_TAIL uint32_t v8_arm_xlate_next(State* s, XL_PARAMS) {
   const uint32_t pc = s->pc;
   const uint32_t B = (uint32_t)(uintptr_t)v8_Default_embedded_blob_code_;
-  if (pc != s->ret && !s->unwind) {
+  if (!s->unwind) {
     uint32_t offset = pc - B;
     if (offset < v8_arm_xlate_blob_size) {
       Function f = s->functions[v8_arm_xlate_index[offset >> 5]];

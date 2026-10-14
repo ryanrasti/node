@@ -544,6 +544,7 @@
               'message': 'generating: >@(_outputs)',
               'inputs': [
                 '<(V8_ROOT)/tools/arm-to-c.py',
+                '<(V8_ROOT)/tools/arm-to-c.profile',
                 '<(INTERMEDIATE_DIR)/embedded.S',
               ],
               'outputs': [
