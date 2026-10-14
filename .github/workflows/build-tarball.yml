@@ -55,7 +55,7 @@ jobs:
           mkdir tarballs
           mv *.tar.gz tarballs
       - name: Upload tarball artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v7
         with:
           name: tarballs
           path: tarballs

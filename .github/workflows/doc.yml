@@ -33,7 +33,7 @@ jobs:
         run: npx envinfo
       - name: Build
         run: NODE=$(command -v node) make doc-only
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         with:
           name: docs
           path: out/doc
