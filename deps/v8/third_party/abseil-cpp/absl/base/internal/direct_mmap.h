@@ -138,9 +138,11 @@ inline void* DirectMmap(void* start, size_t length, int prot, int flags, int fd,
 
 inline int DirectMunmap(void* start, size_t length) {
 #if defined(__wasm32__)
+  // (no munmap system call on tombl's kernel: musl's, as mmap)
   return munmap(start, length);
-#endif
+#else
   return static_cast<int>(syscall(SYS_munmap, start, length));
+#endif
 }
 
 }  // namespace base_internal
