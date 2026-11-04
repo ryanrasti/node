@@ -617,6 +617,13 @@ bool OS::DecommitPages(void* address, size_t size) {
   // shall be removed, as if by an appropriate call to munmap(), before the new
   // mapping is established." As a consequence, the memory will be
   // zero-initialized on next access.
+#if V8_HOST_ARCH_WASM32
+  // linux-workers: Linux without an MMU refuses MAP_FIXED (EINVAL), and
+  // nothing can make the pages inaccessible: they stay mapped, zeroed as a
+  // new mapping's would be.
+  memset(address, 0, size);
+  return true;
+#else
   void* ret = mmap(address, size, PROT_NONE,
                    MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
   if (V8_UNLIKELY(ret == MAP_FAILED)) {
@@ -626,6 +633,7 @@ bool OS::DecommitPages(void* address, size_t size) {
   }
   CHECK_EQ(ret, address);
   return true;
+#endif
 }
 #endif  // !defined(_AIX)
 #endif  // !V8_OS_ZOS
