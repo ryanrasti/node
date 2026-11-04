@@ -33,7 +33,8 @@
         '<!@pymod_do_main(GN-scraper "<(V8_ROOT)/BUILD.gn"  "v8_executable.\\"d8\\".*?sources = ")',
       ],
       'conditions': [
-        # (d8_js2c is gone: d8 builds no host tool of its own)
+        # (d8 builds no host tool of its own: upstream names d8_js2c#host,
+        # a target no gyp file defines)
         [ 'want_separate_host_toolset==1', {
           'toolsets': [ 'target', ],
         }],

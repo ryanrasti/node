@@ -854,7 +854,7 @@ V8 shared library set USING_V8_SHARED.
 #error "Cannot detect Riscv's bitwidth"
 #endif
 #elif defined(__wasm32__)
-// linux-workers: V8 on wasm32 (as a guest of LKL), running an ARM target's
+// linux-workers: V8 on wasm32 (a Linux process), running an ARM target's
 // code in V8's ARM simulator (a 32-bit host, as ia32 is for it)
 #define V8_HOST_ARCH_WASM32 1
 #define V8_HOST_ARCH_32_BIT 1
