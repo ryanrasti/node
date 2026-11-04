@@ -31,7 +31,7 @@
 #if HAVE_OPENSSL
 #include <openssl/crypto.h>
 #include "ncrypto.h"
-#if HAVE_OPENSSL && !defined(OPENSSL_NO_QUIC)
+#ifndef OPENSSL_NO_QUIC
 #include <openssl/quic.h>
 #endif
 #endif  // HAVE_OPENSSL
