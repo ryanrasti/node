@@ -12,7 +12,9 @@
 #ifndef NAPI_EXTERN
 #ifdef _WIN32
 #define NAPI_EXTERN __declspec(dllexport)
-#elif defined(__wasm__)
+// linux-workers: wasm without an OS (emnapi's, WASI's) imports Node-API from
+// "napi"; on Linux an addon is a shared library, linked as natively
+#elif defined(__wasm__) && !defined(__linux__)
 #define NAPI_EXTERN                                                            \
   __attribute__((visibility("default")))                                       \
   __attribute__((__import_module__("napi")))

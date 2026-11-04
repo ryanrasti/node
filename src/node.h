@@ -82,6 +82,7 @@
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <type_traits>
 
 // We cannot use __POSIX__ in this header because that's only defined when
 // building Node.js.
@@ -1363,6 +1364,64 @@ extern "C" NODE_EXTERN void node_module_register(void* mod);
   NODE_CTOR_PREFIX void fn(void)
 #endif
 
+#if defined(__wasm__)
+// linux-workers: wasm checks an indirect call's signature, so an initializer
+// declared with fewer parameters than the type it's cast to (most addons'
+// Init(Local<Object> exports)) traps when Node calls it. A thunk of the
+// exact type calls it with the parameters it takes.
+namespace addon_thunk {
+template <auto F>
+void Register(v8::Local<v8::Object> exports,
+              v8::Local<v8::Value> module,
+              void* priv) {
+  using T = decltype(F);
+  using O = v8::Local<v8::Object>;
+  using V = v8::Local<v8::Value>;
+  if constexpr (std::is_invocable_v<T, O, V, void*>) {
+    F(exports, module, priv);
+  } else if constexpr (std::is_invocable_v<T, O, O, void*>) {
+    F(exports, module.As<v8::Object>(), priv);
+  } else if constexpr (std::is_invocable_v<T, O, V>) {
+    F(exports, module);
+  } else if constexpr (std::is_invocable_v<T, O, O>) {
+    F(exports, module.As<v8::Object>());
+  } else {
+    F(exports);
+  }
+}
+template <auto F>
+void ContextRegister(v8::Local<v8::Object> exports,
+                     v8::Local<v8::Value> module,
+                     v8::Local<v8::Context> context,
+                     void* priv) {
+  using T = decltype(F);
+  using O = v8::Local<v8::Object>;
+  using V = v8::Local<v8::Value>;
+  using C = v8::Local<v8::Context>;
+  if constexpr (std::is_invocable_v<T, O, V, C, void*>) {
+    F(exports, module, context, priv);
+  } else if constexpr (std::is_invocable_v<T, O, O, C, void*>) {
+    F(exports, module.As<v8::Object>(), context, priv);
+  } else if constexpr (std::is_invocable_v<T, O, V, C>) {
+    F(exports, module, context);
+  } else if constexpr (std::is_invocable_v<T, O, O, C>) {
+    F(exports, module.As<v8::Object>(), context);
+  } else {
+    Register<F>(exports, module, priv);
+  }
+}
+}  // namespace addon_thunk
+#define NODE_ADDON_REGISTER_FUNC(regfunc)                             \
+  (&node::addon_thunk::Register<regfunc>)
+#define NODE_ADDON_CONTEXT_REGISTER_FUNC(regfunc)                     \
+  (&node::addon_thunk::ContextRegister<regfunc>)
+#else
+#define NODE_ADDON_REGISTER_FUNC(regfunc)                             \
+  (node::addon_register_func) (regfunc)
+#define NODE_ADDON_CONTEXT_REGISTER_FUNC(regfunc)                     \
+  (node::addon_context_register_func) (regfunc)
+#endif
+
 #define NODE_MODULE_X(modname, regfunc, priv, flags)                  \
   extern "C" {                                                        \
     static node::node_module _module =                                \
@@ -1371,7 +1430,7 @@ extern "C" NODE_EXTERN void node_module_register(void* mod);
       flags,                                                          \
       NULL,  /* NOLINT (readability/null_usage) */                    \
       __FILE__,                                                       \
-      (node::addon_register_func) (regfunc),                          \
+      NODE_ADDON_REGISTER_FUNC(regfunc),                              \
       NULL,  /* NOLINT (readability/null_usage) */                    \
       NODE_STRINGIFY(modname),                                        \
       priv,                                                           \
@@ -1391,7 +1450,7 @@ extern "C" NODE_EXTERN void node_module_register(void* mod);
       NULL,  /* NOLINT (readability/null_usage) */                    \
       __FILE__,                                                       \
       NULL,  /* NOLINT (readability/null_usage) */                    \
-      (node::addon_context_register_func) (regfunc),                  \
+      NODE_ADDON_CONTEXT_REGISTER_FUNC(regfunc),                      \
       NODE_STRINGIFY(modname),                                        \
       priv,                                                           \
       NULL  /* NOLINT (readability/null_usage) */                     \

@@ -5,7 +5,7 @@
 #ifdef _WIN32
 // Building native addon against node
 #define NAPI_EXTERN __declspec(dllimport)
-#elif defined(__wasm__)
+#elif defined(__wasm__) && !defined(__linux__)
 #define NAPI_EXTERN __attribute__((__import_module__("napi")))
 #endif
 #endif
@@ -50,7 +50,9 @@ typedef struct napi_module {
   NAPI_MODULE_INITIALIZER_X_HELPER(base, version)
 #define NAPI_MODULE_INITIALIZER_X_HELPER(base, version) base##version
 
-#ifdef __wasm__
+// linux-workers: wasm without an OS (emnapi's, WASI's) imports Node-API from
+// "napi"; on Linux an addon is a shared library, linked as natively
+#if defined(__wasm__) && !defined(__linux__)
 #define NAPI_MODULE_INITIALIZER_BASE napi_register_wasm_v
 #else
 #define NAPI_MODULE_INITIALIZER_BASE napi_register_module_v
