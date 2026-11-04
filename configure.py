@@ -47,7 +47,8 @@ parser = argparse.ArgumentParser()
 valid_os = ('win', 'mac', 'solaris', 'freebsd', 'openbsd', 'linux',
             'android', 'aix', 'cloudabi', 'os400', 'ios', 'openharmony')
 valid_arch = ('arm', 'arm64', 'ia32', 'mips', 'mipsel', 'mips64el',
-              'ppc64', 'x64', 'x86', 'x86_64', 's390x', 'riscv64', 'loong64')
+              'ppc64', 'x64', 'x86', 'x86_64', 's390x', 'riscv64', 'loong64',
+              'wasm32')
 valid_arm_float_abi = ('soft', 'softfp', 'hard')
 valid_arm_fpu = ('vfp', 'vfpv3', 'vfpv3-d16', 'neon')
 valid_mips_arch = ('loongson', 'r1', 'r2', 'r6', 'rx')
@@ -1610,6 +1611,16 @@ def configure_arm(o):
   o['variables']['arm_fpu'] = options.arm_fpu or arm_fpu
 
 
+def configure_wasm32(o):
+  # linux-workers: a wasm32 Linux process as the host, V8's target ARMv7 with
+  # VFPv3 (V8 wants both or neither), whose code V8's simulator runs
+  o['variables']['v8_target_arch'] = 'arm'
+  o['variables']['arm_version'] = '7'
+  o['variables']['arm_fpu'] = options.arm_fpu or 'vfpv3'
+  o['variables']['arm_float_abi'] = options.arm_float_abi or 'default'
+  o['variables']['arm_thumb'] = 0
+
+
 def configure_mips(o, target_arch):
   can_use_fpu_instructions = options.mips_float_abi != 'soft'
   o['variables']['v8_can_use_fpu_instructions'] = b(can_use_fpu_instructions)
@@ -1732,6 +1743,8 @@ def configure_node(o):
 
   if target_arch == 'arm':
     configure_arm(o)
+  elif target_arch == 'wasm32':
+    configure_wasm32(o)
   elif target_arch in ('mips', 'mipsel', 'mips64el'):
     configure_mips(o, target_arch)
   elif sys.platform == 'zos':
@@ -1978,8 +1991,9 @@ def configure_v8(o, configs):
   o['variables']['v8_random_seed'] = 0  # Use a random seed for hash tables.
   o['variables']['v8_promise_internal_field_count'] = 1 # Add internal field to promises for async hooks.
   o['variables']['v8_use_siphash'] = 0 if options.without_siphash else 1
+  v8_target_arch = o['variables'].get('v8_target_arch', o['variables']['target_arch'])
   o['variables']['v8_enable_maglev'] = B(not options.v8_disable_maglev and
-                                         o['variables']['target_arch'] in maglev_enabled_architectures)
+                                         v8_target_arch in maglev_enabled_architectures)
   o['variables']['v8_enable_pointer_compression'] = 1 if options.enable_pointer_compression else 0
   # Using the sandbox requires always allocating array buffer backing stores in the sandbox.
   # We currently have many backing stores tied to pointers from C++ land that are not
@@ -2599,6 +2613,15 @@ else:
 
 # Add configurations to target defaults
 output['configurations'] = configurations
+
+# The libraries found (a shared OpenSSL's, say) are for the target's links:
+# a cross build's host tools (mksnapshot, torque) are another machine's
+# programs, which can't link them (linux-workers)
+if variables.get('want_separate_host_toolset') and output['libraries']:
+  output['target_conditions'] = [
+    ['_toolset=="target"', {'libraries': output['libraries']}],
+  ]
+  output['libraries'] = []
 
 output = {
   'variables': variables,
