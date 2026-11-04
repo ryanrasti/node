@@ -16,6 +16,10 @@
 #include "src/tracing/trace-event.h"
 #include "src/utils/memcopy.h"
 
+#if V8_HOST_ARCH_WASM32
+#include <pthread.h>
+#endif
+
 #ifdef V8_ENABLE_SPARKPLUG
 #include "src/baseline/baseline-batch-compiler.h"
 #endif
@@ -53,7 +57,34 @@ void StackGuard::update_interrupt_requests_and_stack_limits(
   }
 }
 
+#if V8_HOST_ARCH_WASM32
+namespace {
+// linux-workers: a limit no lower than the thread's stack (clang's, in linear
+// memory) less a reserve. Natively the limit sits far inside a larger stack
+// (984 KiB of 8 MiB), but a wasm process's main thread has 1 MiB, and below
+// the limit V8 goes on using it: overflowing, creating the RangeError and
+// its stack trace took between 224 and 324 KiB more (mjsunit's
+// big-array-literal, big-object-literal and error-tostring, measured by the
+// largest --stack-size each passed with), and past the stack's end it
+// writes over whatever lies below, without an MMU's guard page.
+constexpr uintptr_t kStackReserve = 384 * KB;
+uintptr_t WithinStack(uintptr_t limit) {
+  pthread_attr_t attr;
+  if (pthread_getattr_np(pthread_self(), &attr) != 0) return limit;
+  void* base;
+  size_t size;
+  int got = pthread_attr_getstack(&attr, &base, &size);
+  pthread_attr_destroy(&attr);
+  if (got != 0 || size <= kStackReserve) return limit;
+  return std::max(limit, reinterpret_cast<uintptr_t>(base) + kStackReserve);
+}
+}  // namespace
+#endif
+
 void StackGuard::SetStackLimit(uintptr_t limit) {
+#if V8_HOST_ARCH_WASM32
+  limit = WithinStack(limit);
+#endif
   ExecutionAccess access(isolate_);
   SetStackLimitInternal(access, limit,
                         SimulatorStack::JsLimitFromCLimit(isolate_, limit));
@@ -249,6 +280,9 @@ void StackGuard::ThreadLocal::Initialize(Isolate* isolate,
   const uintptr_t kLimitSize = v8_flags.stack_size * KB;
   DCHECK_GT(base::Stack::GetStackStart(), kLimitSize);
   uintptr_t limit = base::Stack::GetStackStart() - kLimitSize;
+#if V8_HOST_ARCH_WASM32
+  limit = WithinStack(limit);
+#endif
   real_jslimit_ = SimulatorStack::JsLimitFromCLimit(isolate, limit);
   set_jslimit(SimulatorStack::JsLimitFromCLimit(isolate, limit));
 #ifdef USE_SIMULATOR
