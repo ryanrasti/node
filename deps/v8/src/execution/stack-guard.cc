@@ -18,6 +18,7 @@
 
 #if V8_HOST_ARCH_WASM32
 #include <pthread.h>
+#include <sys/auxv.h>
 #endif
 
 #ifdef V8_ENABLE_SPARKPLUG
@@ -59,24 +60,42 @@ void StackGuard::update_interrupt_requests_and_stack_limits(
 
 #if V8_HOST_ARCH_WASM32
 namespace {
-// linux-workers: a limit no lower than the thread's stack (clang's, in linear
-// memory) less a reserve. Natively the limit sits far inside a larger stack
-// (984 KiB of 8 MiB), but a wasm process's main thread has 1 MiB, and below
-// the limit V8 goes on using it: overflowing, creating the RangeError and
-// its stack trace took between 224 and 324 KiB more (mjsunit's
-// big-array-literal, big-object-literal and error-tostring, measured by the
-// largest --stack-size each passed with), and past the stack's end it
-// writes over whatever lies below, without an MMU's guard page.
+// linux-workers: a limit within both of a wasm thread's stacks.
+//
+// Its own (clang's, in linear memory): no lower than its base plus a
+// reserve. Natively the limit sits far inside a larger stack (984 KiB of 8
+// MiB), but a wasm process's main thread has 1 MiB, and below the limit V8
+// goes on using it: overflowing, creating the RangeError and its stack
+// trace took between 224 and 324 KiB more (mjsunit's big-array-literal,
+// big-object-literal and error-tostring, measured by the largest
+// --stack-size each passed with), and past the stack's end it writes over
+// whatever lies below, without an MMU's guard page.
+//
+// The host's, under its frames (auxv's AT_WASM_HOST_STACK, the kernel's
+// from the host; else 984 KiB, V8's default JSPI stack): no more than an
+// eighth of it from the stack's top. The thread's frames take more of the
+// host's stack than of its own, between 3.2 and 6.4 times as much
+// (V8's parser on nested literals: the largest --stack-size that kept
+// within the host's 984 KiB, 2 MiB and 4 MiB), and running out of the host's
+// is a trap, not a RangeError.
 constexpr uintptr_t kStackReserve = 384 * KB;
+constexpr unsigned long kAtWasmHostStack = 0x7764;
+constexpr uintptr_t kDefaultHostStack = 984 * KB;
+constexpr uintptr_t kHostStackShare = 8;
 uintptr_t WithinStack(uintptr_t limit) {
+  uintptr_t host = getauxval(kAtWasmHostStack);
+  if (host == 0) host = kDefaultHostStack;
   pthread_attr_t attr;
   if (pthread_getattr_np(pthread_self(), &attr) != 0) return limit;
   void* base;
   size_t size;
   int got = pthread_attr_getstack(&attr, &base, &size);
   pthread_attr_destroy(&attr);
-  if (got != 0 || size <= kStackReserve) return limit;
-  return std::max(limit, reinterpret_cast<uintptr_t>(base) + kStackReserve);
+  if (got != 0) return limit;
+  uintptr_t bottom = reinterpret_cast<uintptr_t>(base);
+  uintptr_t top = bottom + size;
+  if (size > kStackReserve) limit = std::max(limit, bottom + kStackReserve);
+  return std::max(limit, top - std::min<uintptr_t>(size, host / kHostStackShare));
 }
 }  // namespace
 #endif
