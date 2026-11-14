@@ -73,7 +73,9 @@ namespace {
 //
 // The host's, under its frames (auxv's AT_WASM_HOST_STACK, the kernel's
 // from the host; else 984 KiB, V8's default JSPI stack): no more than an
-// eighth of it from the stack's top. The thread's frames take more of the
+// eighth of it below where the thread's frames are as its limit is set (a
+// main thread's are well below its stack's top: the loader's arguments,
+// 256 KiB, are above them). The thread's frames take more of the
 // host's stack than of its own, between 3.2 and 6.4 times as much
 // (V8's parser on nested literals: the largest --stack-size that kept
 // within the host's 984 KiB, 2 MiB and 4 MiB), and running out of the host's
@@ -95,7 +97,8 @@ uintptr_t WithinStack(uintptr_t limit) {
   uintptr_t bottom = reinterpret_cast<uintptr_t>(base);
   uintptr_t top = bottom + size;
   if (size > kStackReserve) limit = std::max(limit, bottom + kStackReserve);
-  return std::max(limit, top - std::min<uintptr_t>(size, host / kHostStackShare));
+  uintptr_t here = std::min(top, base::Stack::GetCurrentStackPosition());
+  return std::max(limit, here - std::min<uintptr_t>(here - bottom, host / kHostStackShare));
 }
 }  // namespace
 #endif
